@@ -4,7 +4,7 @@
  * The base of IOGraphicsAccelerator2, which is the class our driver must BE.
  * Apple ships no header.
  *
- * ⚠️ THIS CLASS DOES NOT LIVE IN IOAcceleratorFamily2. It is UNDEFINED there
+ * THIS CLASS DOES NOT LIVE IN IOAcceleratorFamily2. It is UNDEFINED there
  * (`nm` shows `U __ZN13IOAccelerator10gMetaClassE`). It lives in
  * IOGraphicsFamily, which Sequoia ships ONLY inside SystemKernelExtensions.kc —
  * there is no standalone binary on disk. Read it with:
@@ -20,7 +20,7 @@
  *   vtable      __ZTV13IOAccelerator, 270 slots, of which only the destructors
  *               and getMetaClass() are its own.
  *
- * ⭐ WHY THIS ONE IS SAFE DESPITE COMING FROM A COLLECTION
+ * WHY THIS ONE IS SAFE DESPITE COMING FROM A COLLECTION
  * A .kc-sourced class normally gets WEAKER verification: prelinked slots are
  * chained pointers whose cacheLevel-0 targets (the kernel's own methods) resolve
  * to nothing, so inherited slots read blank and verify_class.py can only compare

@@ -1,13 +1,16 @@
 # NullMoth NVIDIA Driver for macOS
 
-A Metal driver for NVIDIA GeForce RTX cards on Intel Macs and OpenCore systems running **macOS 15 Sequoia**.
-Your NVIDIA card drives the desktop, Metal apps, games, Core ML/MPS, and OpenCL — the way an Apple-supported GPU does.
+A Metal driver for NVIDIA Turing-and-later cards on Intel Macs and OpenCore systems running **macOS 15 Sequoia**.
+The device table includes GTX 16, RTX 20/30/40/50, TITAN RTX, and supported Quadro/RTX workstation cards.
+The driver implements NVIDIA-backed display and Metal interfaces. Feature availability and application behavior depend on the card, operating-system version and installed components; device-table coverage is not runtime qualification.
 
 Made by **NullMoth Systems**.
 
+**Latest maintenance update:** [1401 Mac 1.0.17 / driver helper package 1.0.11](docs/RELEASE-1.0.17.md). See the change list, validation and remaining work before updating.
+
 Installing macOS from Windows? Use **1401**: https://github.com/nullmoth/1401
 
-> **This driver is new and may not work on every PC.** It is tested on an RTX 5060 under macOS 15.7.x. If your PC does
+> **This driver is new and may not work on every PC.** It is tested on an RTX 5060 under macOS 15.7.x and 15.8.1. Device-table coverage is broader than physical hardware validation; see [card support](docs/CARD-SUPPORT.md). If your PC does
 > not boot macOS with OpenCore yet, set that up first with the
 > [OpenCore Install Guide](https://dortania.github.io/OpenCore-Install-Guide/)
 > ([OpenCore releases](https://github.com/acidanthera/OpenCorePkg/releases)), then install the driver.
@@ -17,8 +20,8 @@ Support the work: https://buymeacoffee.com/nullmoth
 
 | | |
 |---|---|
-| macOS | 15 Sequoia (tested 15.7.x), x86_64 |
-| GPUs | NVIDIA GeForce RTX (GSP firmware generation); tested on an RTX 5060 |
+| macOS | 15 Sequoia (tested 15.7.x and 15.8.1), x86_64 |
+| GPUs | NVIDIA Turing and later from the GSP device table; physical validation: RTX 5060 |
 | Metal | Metal 3: argument buffers tier 2, ray tracing, mesh shaders, MPS, MetalFX path |
 | Also | OpenGL (through Apple's GL-on-Metal), OpenCL, Core Image, Core ML |
 
@@ -54,9 +57,8 @@ macOS asks you to **allow the extensions** in System Settings → Privacy & Secu
 
 ## 1401 Mac app (easiest)
 
-Download `1401-Mac-1.0.2.dmg` from **Releases**, open it, and run **1401** (the driver package is inside the disk
-image, so nothing else to download). Follow its four steps. It works on any OpenCore
-setup, whether 1401 built it or you did: it finds the OpenCore that started your Mac (in `EFI/OC` or `EFI/BOOT`, on an
+Download the latest `1401-Mac-<version>.dmg` from **Releases**, open it, and run **1401** (the driver package is inside the disk
+image, so nothing else to download). Follow its steps. A supported setup must use a verified or explicitly selected OpenCore partition. The app finds the OpenCore that started your Mac (in `EFI/OC` or `EFI/BOOT`, on an
 EFI or FAT32 partition), shows every change before making it, backs the config up, installs the driver, and adds
 **1401: Remove NVIDIA driver** to the OpenCore boot picker. Choosing that entry removes the driver at the next start and
 puts the Mac back exactly as it was before the install, OpenCore config included, then restarts by itself. The app also
@@ -64,14 +66,13 @@ maps your USB ports and, if the driver ever crashes the Mac, offers to make a cr
 (it never sends anything on its own).
 
 **Something not working?** Open 1401 > Crash report > **Send logs to NullMoth**. It sends what 1401 did, the driver's
-state, crash reports that name the driver and OpenCore's startup logs (names, serial numbers and addresses removed), each
+state, driver crash reports, recent WindowServer crash reports and OpenCore's startup logs (names, serial numbers and addresses removed), each
 with a SHA-256 the site checks, and shows a report ID to quote in the NullMoth Discord.
 
-**macOS 26 Tahoe (beta):** the package carries a Tahoe build of NVAccel. Click **Prepare this Mac for Tahoe** before updating
-in System Settings; the first start of Tahoe sets the driver up and restarts once. Not yet tested on hardware.
+**macOS 26 Tahoe:** the package carries a separate NVAccel build, but full hardware and application qualification remains pending. The obsolete preparation action has been removed from the app; do not treat package contents as a verified upgrade path.
 
 **Keep the USB stick or disk OpenCore started your Mac from plugged in** while the app runs: that is the config it
-changes. It only edits a config whose SMBIOS model matches this Mac, and stops if none is connected. After the install,
+changes. A shared SMBIOS model alone does not establish the startup partition. Automatic USB-to-internal copying is disabled, preserving Windows and vendor boot files. Driver installation uses the selected startup partition. Keep the OpenCore stick attached for every restart until the internal boot setup is reviewed. After the install,
 restart; the first start with the driver pauses for up to a minute at "PCI configuration end" while the GPU comes up.
 
 ## Wiring into an existing OpenCore setup

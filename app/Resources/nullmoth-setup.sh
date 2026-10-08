@@ -8,10 +8,11 @@ TOOL_NAME="1401: Remove NVIDIA driver"; TOOL_FILE=NullMothSafe.efi
 ST=${NULLMOTH_STATE_DIR:-/Library/NullMoth}; STATE=$ST/state
 AGENT=/Library/LaunchAgents/com.nullmoth.crashcheck.plist
 RECOVER=/Library/LaunchDaemons/com.nullmoth.recover.plist
-COLLECT=""; UPD=""; VERB=""; PKG=""; SHA=""; CFG=""; EFI=auto; DRY=0; REMOVE=0; USBMAP=""; TOOL=""; APPBIN=""; MOUNTED=""; T=""
+KNOBS=(); PROFILE=""; COLLECT=""; UPD=""; VERB=""; PKG=""; SHA=""; CFG=""; EFI=auto; DRY=0; REMOVE=0; USBMAP=""; TOOL=""; APPBIN=""; MOUNTED=""; T=""
 while [ $# -gt 0 ]; do case "$1" in
   --pkg) PKG=$2; shift;; --sha) SHA=$2; shift;; --config) CFG=$2; shift;; --efi) EFI=$2; shift;;
   --tool) TOOL=$2; shift;; --usbmap) USBMAP=$2; shift;; --app) APPBIN=$2; shift;; --dry) DRY=1;; --remove) REMOVE=1;; --verbose) VERB=$2; shift;; --update) UPD=$2; shift;; --collect-logs) COLLECT=$2; shift;;
+  --knob) KNOBS+=("$2"); shift;; --profile) PROFILE=$2; shift;;
   *) echo "STOP unknown option $1"; echo "RESULT stop"; exit 2;; esac; shift; done
 step() { echo "STEP $*"; }; ok() { echo "OK $*"; }; note() { echo "NOTE $*"; }
 cleanup() { for d in $MOUNTED; do diskutil unmount "$d" >/dev/null 2>&1; done; [ -n "$T" ] && rm -rf "$T"; }
@@ -21,10 +22,26 @@ stop() { echo "STOP $*"; cleanup; echo "RESULT stop"; exit 1; }
 has() { plutil -extract "$1" raw -o - "$C" >/dev/null 2>&1; }
 get() { plutil -extract "$1" raw -o - "$C" 2>/dev/null; }
 mnt() { diskutil info "$1" 2>/dev/null | awk -F': *' '/Mount Point/{print $2}'; }
-mount_efi() {   # $1 = device or partition UUID; prints the mount point
+mount_efi() {   # $1 = device or partition UUID; sets MOUNT_POINT in this shell
   local mp; mp=$(mnt "$1")
   if [ -z "$mp" ]; then diskutil mount "$1" >/dev/null 2>&1 || return 1; MOUNTED="$MOUNTED $1"; mp=$(mnt "$1"); fi
-  echo "$mp"; }
+  MOUNT_POINT=$mp; [ -n "$MOUNT_POINT" ]; }
+owned_amfi_from_prior_record() (
+  # Inherit only explicitly recorded shared-token ownership from the unchanged
+  # configuration on the same identified partition. Legacy or changed records
+  # do not establish ownership. Read the record without altering this shell.
+  local record=$1 expected_uuid=$2 expected_path=$3 expected_ocrel=$4 expected_sha=$5 expected_args=$6 a
+  [ -n "$expected_uuid" ] && [ -f "$record" ] || exit 0
+  EFI_UUID=""; CONFIG_PATH=""; OCREL=""; CONFIG_SHA_AFTER=""; ADDED_ARGS=""
+  . "$record" >/dev/null 2>&1 || exit 0
+  [ "$EFI_UUID" = "$expected_uuid" ] && [ "$CONFIG_PATH" = "$expected_path" ] &&
+    [ "$OCREL" = "$expected_ocrel" ] && [ "$CONFIG_SHA_AFTER" = "$expected_sha" ] || exit 0
+  for a in $ADDED_ARGS; do
+    case "$a" in amfi=0x80|amfi_get_out_of_my_way=0x1)
+      case " $expected_args " in *" $a "*) printf '%s\n' "$a";; esac;;
+    esac
+  done
+)
 ocrel_in() {    # $1 = mount point; prints where OpenCore lives on it (EFI/OC, or EFI/BOOT when OpenCore.efi is BOOTx64.efi)
   # A config made for another Mac model (a rescue stick, another machine's EFI) is never this Mac's: OpenCore sets the
   # model macOS reports from PlatformInfo, so the config that started this Mac names hw.model. (Measured 10-07: the boot-path
@@ -65,8 +82,27 @@ on_usb() {      # true when the partition is on an external or removable disk (a
   diskutil info "$1" 2>/dev/null | grep -q -E 'Removable Media: *(Removable|Yes)|Device Location: *External|Protocol: *USB'; }
 bidx() { local i=0 p; while p=$(plutil -extract Kernel.Block.$i.Identifier raw -o - "$C" 2>/dev/null); do [ "$p" = com.apple.iokit.IONDRVSupport ] && { echo $i; return; }; i=$((i+1)); done; }
 
+# Copy newest files without splitting volume or file names at whitespace.
+collect_recent_logs() {
+  local prefix=$1 limit=$2 f i; shift 2
+  local recent=()
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    i=0
+    while [ $i -lt ${#recent[@]} ] && [ ! "$f" -nt "${recent[$i]}" ]; do i=$((i+1)); done
+    [ $i -lt "$limit" ] || continue
+    recent=("${recent[@]:0:$i}" "$f" "${recent[@]:$i}")
+    recent=("${recent[@]:0:$limit}")
+  done
+  for f in "${recent[@]}"; do
+    if cp "$f" "$COLLECT/$prefix-$(basename "$f")"; then n=$((n+1))
+    else note "could not copy diagnostic log: $f"; collection_errors=$((collection_errors+1)); fi
+  done
+}
+
 if [ -n "$COLLECT" ]; then
-  # ⭐ "Send logs": gather what only root can read into $COLLECT for the app to upload. Read-only on the system: it
+  trap cleanup EXIT HUP INT TERM
+  # "Send logs": gather what only root can read into $COLLECT for the app to upload. Read-only on the system: it
   # copies files and prints state, and unmounts any EFI partition it mounted. Every OpenCore partition is checked,
   # sticks included, for OpenCore's own log (opencore-*.txt) and macOS panics it saved (panic-*.txt).
   mkdir -p "$COLLECT" || { echo "RESULT stop"; exit 1; }
@@ -76,20 +112,133 @@ if [ -n "$COLLECT" ]; then
     echo; echo "== NullMoth kexts loaded"; kmutil showloaded --list-only 2>/dev/null | grep -i nullmoth
     echo; echo "== auxiliary collection"; kmutil inspect -a x86_64 -A /Library/KernelCollections/AuxiliaryKernelExtensions.kc 2>/dev/null | grep -i nullmoth
     echo; echo "== driver files"; ls -la /Library/Extensions/NV*.kext /Library/GPUBundles 2>/dev/null
-    echo; echo "== NVRM"; ioreg -r -n NVRM -d 1 -l 2>/dev/null | grep -E '"nvrm-' ; } > "$COLLECT/driver-state.txt" 2>&1
-  n=0
-  for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
-    mp=$(mount_efi "$d") || continue
-    for f in $(ls -t "$mp"/opencore-*.txt 2>/dev/null | head -3) $(ls -t "$mp"/panic-*.txt 2>/dev/null | head -5); do
-      cp "$f" "$COLLECT/$d-$(basename "$f")" && n=$((n+1)); done
+    echo; echo "== installed component fingerprints"
+    [ ! -f "$ST/driver-version" ] || { printf 'installed driver version: '; cat "$ST/driver-version"; }
+    for f in /Library/Extensions/NVRM.kext/Contents/MacOS/NVRM /Library/Extensions/NVAccel.kext/Contents/MacOS/NVAccel /Library/Extensions/NVRMFB.kext/Contents/MacOS/NVRMFB /Library/Extensions/NVRMAGDC.kext/Contents/MacOS/NVRMAGDC /Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/NVMTLDriver /Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib; do
+      [ ! -f "$f" ] || shasum -a 256 "$f"
+    done
+    echo; echo "== processor"; sysctl machdep.cpu.vendor machdep.cpu.brand_string machdep.cpu.family machdep.cpu.model machdep.cpu.stepping 2>&1
+    echo; echo "== NVRM"; ioreg -r -n NVRM -d 1 -l 2>/dev/null | grep -E '"nvrm-'
+    echo; echo "== system profile and per-system rules"; cat "$ST/system-profile.json" 2>/dev/null || echo "(none recorded)"
+    sed -n '/^# --- 1401 per-system rules ---$/,/^# --- end 1401 per-system rules ---$/p' /Library/GPUBundles/nvmtl/nvrm610.conf 2>/dev/null
+    # 10-07 (NM-34FKN6ZK): a second user's install failed and nothing sent named the card. The GPU model and PCI ID
+    # are what decide which code path the driver takes (Turing/Ampere/Ada/Blackwell).
+    echo; echo "== graphics"; system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset Model|Type:|Bus:|VRAM|Vendor|Device ID|Revision ID|Metal|Resolution|Display Type|Online"
+    echo; echo "== NVIDIA PCI devices"; ioreg -r -c IOPCIDevice -d 1 -l 2>/dev/null | awk '
+      /\+-o / { if (nv) print block; block=$0; nv=0; next }
+      /"vendor-id" = <de100000>/ { nv=1 }
+      /"(vendor-id|device-id|subsystem-vendor-id|subsystem-id|class-code|model|assigned-addresses|reg|nvrm-[^"]*)"/ { block=block "\n" $0 }
+      END { if (nv) print block }'
+    echo; echo "== display bring-up"; sysctl kern.boottime debug.nvaccel_heads_published debug.nvaccelfb debug.nvrmfb_agdc debug.nvaccel_iop 2>&1
+    } > "$COLLECT/driver-state.txt" 2>&1
+  # the kernel's own words from the last boots: NVRM/NVAccel/NVRMFB print why they stopped (GSP boot, BAR, display).
+  # A boot that hung early may not have reached the log store; a later boot's panic report then carries it.
+  log show --last 3d --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "nvidia" OR eventMessage CONTAINS[c] "nullmoth" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
+    | tail -n 6000 > "$COLLECT/driver-kernel-log.txt"
+  log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-kernel-log.txt"
+  # The current kernel message ring can retain early GSP/BAR failures absent from the log store.
+  { echo; echo "== current kernel message ring"; dmesg 2>&1 | grep -iE 'nvrm|nvaccel|nvidia|nullmoth|gsp' | tail -n 2000; } >> "$COLLECT/driver-kernel-log.txt"
+  # Keep update/snapshot context separate so APFS traffic cannot crowd out GPU errors.
+  log show --last 3d --style compact --predicate '(process == "kernel" AND eventMessage CONTAINS[c] "apfs") OR process == "MobileSoftwareUpdate" OR process == "softwareupdated"' 2>&1 \
+    | tail -n 2000 > "$COLLECT/driver-update-log.txt"
+  log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-update-log.txt"
+  { echo; echo "== current update message ring"; dmesg 2>&1 | grep -iE 'apfs|MobileSoftwareUpdate|softwareupdated' | tail -n 1000; } >> "$COLLECT/driver-update-log.txt"
+  # Release builds report failures to syslog rather than nvmtl.log. Debug builds may use either
+  # the system temp directory or the console user's temp directory.
+  log show --last 3d --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason")' 2>&1 \
+    | tail -n 3000 > "$COLLECT/driver-plugin-log.txt"
+  log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-plugin-log.txt"
+  console_user=$(stat -f %Su /dev/console 2>/dev/null)
+  console_tmp=""
+  if [ -n "$console_user" ] && [ "$console_user" != root ] && [ "$console_user" != loginwindow ]; then
+    console_tmp=$(sudo -u "$console_user" getconf DARWIN_USER_TEMP_DIR 2>/dev/null)
+  fi
+  for f in /private/tmp/nvmtl.log "${console_tmp:+${console_tmp%/}/nvmtl.log}"; do
+    [ -f "$f" ] || continue
+    { echo; echo "== plugin file log"; tail -c 262144 "$f"; } >> "$COLLECT/driver-plugin-log.txt"
   done
-  chmod -R a+rX "$COLLECT"; ok "collected driver state and $n OpenCore/panic log(s)"; cleanup; echo "RESULT ok"; exit 0
+  n=0; collection_errors=0
+  collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/*.panic
+  # WindowServer can fail outside a driver frame. Include the complete recent reports
+  # during an explicit Send logs request; automatic crash notifications stay selective.
+  collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/WindowServer*.ips /Library/Logs/DiagnosticReports/Retired/WindowServer*.ips
+  collect_recent_logs macos 1 /Library/Logs/DiagnosticReports/firefox*.ips /Library/Logs/DiagnosticReports/Firefox*.ips /Library/Logs/DiagnosticReports/Retired/firefox*.ips /Library/Logs/DiagnosticReports/Retired/Firefox*.ips
+  collect_recent_logs macos 1 /Library/Logs/DiagnosticReports/plugin-container*.ips /Library/Logs/DiagnosticReports/Retired/plugin-container*.ips
+  collect_recent_logs macos 1 /Library/Logs/DiagnosticReports/Blender*.ips /Library/Logs/DiagnosticReports/Retired/Blender*.ips
+  for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
+    mount_efi "$d" || continue; mp=$MOUNT_POINT
+    collect_recent_logs "$d" 3 "$mp"/opencore-*.txt
+    collect_recent_logs "$d" 5 "$mp"/panic-*.txt
+  done
+  chmod -R a+rX "$COLLECT"; ok "collected driver state and $n diagnostic log(s)"; cleanup
+  if [ "$collection_errors" -gt 0 ]; then note "$collection_errors diagnostic log(s) could not be copied"; echo "RESULT partial"; exit 1; fi
+  echo "RESULT ok"; exit 0
 fi
 
 if [ $REMOVE = 1 ]; then
   step "Removing the NullMoth driver"
   [ -f "$STATE" ] || stop "no install record in $STATE - was the driver installed by this app?"
-  . "$STATE"
+  . "$STATE" || stop "the install record is invalid - nothing changed"
+  C=""; MP=""
+  if [ -n "$CFG" ]; then
+    C=$CFG; [ -f "$C" ] || stop "the selected OpenCore config is missing - nothing changed"
+    MP=$(cd "$(dirname "$C")/../.." && pwd) || stop "cannot resolve the selected OpenCore partition"
+  elif [ "$EFI" != auto ]; then
+    mount_efi "$EFI" || stop "could not mount the selected OpenCore partition - nothing changed"; MP=$MOUNT_POINT
+    C="$MP/${OCREL:-EFI/OC}/config.plist"
+  elif [ -n "${EFI_UUID:-}" ]; then
+    mount_efi "$EFI_UUID" || stop "could not mount the recorded OpenCore partition; attach the original boot disk or select its replacement - nothing changed"; MP=$MOUNT_POINT
+    C="$MP/${OCREL:-EFI/OC}/config.plist"
+  elif [ -n "${CONFIG_PATH:-}" ]; then
+    C=$CONFIG_PATH; [ -f "$C" ] || stop "the recorded config is missing - nothing changed"
+    MP=$(cd "$(dirname "$C")/../.." && pwd) || stop "cannot resolve the recorded OpenCore partition"
+  fi
+  [ -n "$C" ] || stop "the install record has no OpenCore partition; select the original config - nothing changed"
+  if [ -n "$C" ]; then
+    [ -f "$C" ] && plutil -lint "$C" >/dev/null || stop "the OpenCore config is missing or invalid - nothing changed"
+    [ -f "$MP/${CONFIG_BACKUP_REL:-}" ] || stop "the recorded OpenCore backup is missing on this partition - nothing changed"
+  fi
+  if [ -n "$C" ]; then
+    step "Checking the OpenCore removal settings"
+    ORIGINAL_CONFIG=$C
+    C="$ORIGINAL_CONFIG.nullmoth-remove-new"
+    cp -p "$ORIGINAL_CONFIG" "$C" || stop "could not stage the OpenCore removal settings - nothing changed"
+    if [ "$(shasum -a 256 "$C" | awk '{print $1}')" = "$CONFIG_SHA_AFTER" ] && [ -f "$MP/$CONFIG_BACKUP_REL" ]; then
+      cp -p "$MP/$CONFIG_BACKUP_REL" "$C" || stop "could not stage the original config - nothing changed"
+    else
+      note "the config changed after the install, so unrelated settings are preserved"
+    fi
+    # An upgrade backup may itself contain an older driver configuration. Clear
+    # the driver settings on both paths before deleting the recovery tool.
+      i=0
+      while identifier=$(plutil -extract Kernel.Block.$i.Identifier raw -o - "$C" 2>/dev/null); do
+        if [ "$identifier" = com.nullmoth.NVAccel ] && [ "$(get Kernel.Block.$i.Comment)" = "park the OS-specific accelerator during a macOS update" ]; then
+          plutil -remove Kernel.Block.$i "$C" || stop "could not stage removal of the update parking entry - nothing changed"
+          continue
+        fi
+        i=$((i+1))
+      done
+      args=$(get NVRAM.Add.$B.boot-args); new=""
+      for a in $args; do
+        case "$a" in nvfb=*|nvaccel=*|nvfbheads=*|-nvkmsnosmooth|-nvoff) continue;; esac
+        # AMFI settings may belong to another driver or an earlier system setup.
+        # Remove shared settings only when the install record owns the token.
+        case " $ADDED_ARGS " in *" $a "*) ;; *) new="$new $a";; esac
+      done
+      for a in $REMOVED_ARGS; do
+        case "$a" in nvfb=*|nvaccel=*|nvfbheads=*|-nvkmsnosmooth|-nvoff) continue;; esac
+        case " $new " in *" $a "*) ;; *) new="$new $a";; esac
+      done
+      plutil -replace NVRAM.Add.$B.boot-args -string "${new# }" "$C" || stop "could not stage boot arguments - nothing changed"
+      if [ "$(csr_of)" = "${NEW_CSR:-x}" ]; then plutil -replace NVRAM.Add.$B.csr-active-config -data "$(csr_data "$OLD_CSR")" "$C" || stop "could not stage the recorded SIP setting - nothing changed"; fi
+      if [ -n "${OLD_SBM:-}" ] && [ "$(get Misc.Security.SecureBootModel)" = Disabled ]; then plutil -replace Misc.Security.SecureBootModel -string "$OLD_SBM" "$C" || stop "could not stage SecureBootModel - nothing changed"; fi
+      i=$(tool_index); if [ -n "$i" ]; then plutil -remove Misc.Tools.$i "$C" || stop "could not stage removal of the picker tool - nothing changed"; fi
+      # back to the installer-safe settings 1401 wrote: small BAR for macOS, firmware framebuffer allowed
+      plutil -replace UEFI.Quirks.ResizeGpuBars -integer -1 "$C" && plutil -replace Booter.Quirks.ResizeAppleGpuBars -integer 0 "$C" || stop "could not stage installer-safe BAR settings - nothing changed"
+      bi=$(bidx 2>/dev/null); if [ -n "$bi" ]; then plutil -replace Kernel.Block.$bi.Enabled -bool false "$C" || stop "could not stage firmware display support - nothing changed"; fi
+
+    plutil -lint "$C" >/dev/null || stop "the staged removal config is invalid - nothing changed"
+  fi
   if [ "${NULLMOTH_CONFIG_ONLY:-0}" != 1 ]; then
     # the app carries the current uninstaller: a Mac that installed an older driver kept that version's copy in $ST
     # (1.0.0's could not remove the driver when no other kext was installed)
@@ -99,35 +248,23 @@ if [ $REMOVE = 1 ]; then
     "$UN" "${DRIVER_BACKUP:-}" 2>&1 | sed 's/^/NOTE /'
     rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || stop "the driver uninstaller failed (exit $rc)"
     ok "driver files removed and the kernel collection rebuilt"
-    rm -f "$AGENT"
-  rm -f "$RECOVER" "$ST/nullmoth-recover.sh"
   fi
-  if [ -n "${EFI_UUID:-}" ] || [ -n "$CFG" ]; then
-    step "Undoing the OpenCore changes"
-    if [ -n "$CFG" ]; then C=$CFG; MP=$(cd "$(dirname "$C")/../.." && pwd)
-    else MP=$(mount_efi "$EFI_UUID") || stop "could not mount the OpenCore partition $EFI_UUID - restore $CONFIG_BACKUP by hand"
-      C="$MP/${OCREL:-EFI/OC}/config.plist"; fi
-    if [ "$(shasum -a 256 "$C" | awk '{print $1}')" = "$CONFIG_SHA_AFTER" ] && [ -f "$MP/$CONFIG_BACKUP_REL" ]; then
-      cp -p "$MP/$CONFIG_BACKUP_REL" "$C" && ok "config restored from the backup taken before the install"
-    else
-      note "the config changed after the install, so only NullMoth's own edits are undone"
-      args=$(get NVRAM.Add.$B.boot-args); new=""
-      for a in $args; do case " $ADDED_ARGS " in *" $a "*) ;; *) new="$new $a";; esac; done
-      for a in $REMOVED_ARGS; do new="$new $a"; done
-      plutil -replace NVRAM.Add.$B.boot-args -string "${new# }" "$C"
-      [ "$(csr_of)" = "${NEW_CSR:-x}" ] && plutil -replace NVRAM.Add.$B.csr-active-config -data "$(csr_data "$OLD_CSR")" "$C"
-      [ -n "${OLD_SBM:-}" ] && [ "$(get Misc.Security.SecureBootModel)" = Disabled ] && plutil -replace Misc.Security.SecureBootModel -string "$OLD_SBM" "$C"
-      i=$(tool_index); [ -n "$i" ] && plutil -remove Misc.Tools.$i "$C"
-      # back to the installer-safe settings 1401 wrote: small BAR for macOS, firmware framebuffer allowed
-      plutil -replace UEFI.Quirks.ResizeGpuBars -integer -1 "$C"; plutil -replace Booter.Quirks.ResizeAppleGpuBars -integer 0 "$C"
-      bi=$(bidx 2>/dev/null); [ -n "$bi" ] && plutil -replace Kernel.Block.$bi.Enabled -bool false "$C"
-      plutil -lint "$C" >/dev/null || { cp -p "$MP/$CONFIG_BACKUP_REL" "$C"; note "the edited config failed to lint; restored the pre-install backup instead"; }
-      ok "NullMoth's OpenCore edits undone"
-    fi
-    rm -f "$MP/${OCREL:-EFI/OC}/Tools/$TOOL_FILE"
+  if [ -n "$C" ]; then
+    mv -f "$C" "$ORIGINAL_CONFIG" || stop "could not publish OpenCore removal settings; recovery remains available"
+    C=$ORIGINAL_CONFIG
+    rm -f "$MP/${OCREL:-EFI/OC}/Tools/$TOOL_FILE" || stop "could not remove the picker tool; recovery remains available"
+    ok "OpenCore removal settings published"
   fi
-  mv "$STATE" "$STATE.removed-$(date +%Y%m%d-%H%M%S)"
+  mv "$STATE" "$STATE.removed-$(date +%Y%m%d-%H%M%S)" || stop "could not archive the install record"
+  rm -f "$AGENT" "$RECOVER" "$ST/nullmoth-recover.sh"
   ok "done - restart to finish"; cleanup; echo "RESULT ok"; exit 0
+fi
+
+# Preparation is for an upgrade from macOS 15. On macOS 26, parking the driver would
+# leave update-pending waiting for a major-version change that cannot happen.
+if [ "$UPD" = prepare ]; then
+  PREPARE_MAJOR=$(sw_vers -productVersion); PREPARE_MAJOR=${PREPARE_MAJOR%%.*}
+  [ "$PREPARE_MAJOR" = 15 ] || stop "Tahoe preparation requires macOS 15; this Mac already runs macOS $PREPARE_MAJOR. Use the normal driver install or update."
 fi
 
 # "--update prepare" with a package is the one-button Tahoe path: install or update the driver first, then prepare.
@@ -138,26 +275,35 @@ step "Checking the driver package"
 got=$(shasum -a 256 "$PKG" | awk '{print $1}')
 [ "$got" = "$SHA" ] || stop "package checksum $got does not match $SHA - download it again"
 ok "package matches its SHA-256"
+INSTALLER="$(cd "$(dirname "$0")" && pwd)/nullmoth-install.sh"
+[ -x "$INSTALLER" ] || stop "the audited installer is missing from the app"
 [ -n "$TOOL" ] && [ -f "$TOOL" ] || stop "the boot-picker tool is missing from the app"
+# This must precede EFI discovery/copy, SIP edits and driver staging.
+T=$(mktemp -d /var/tmp/nullmoth.XXXX) || stop "could not create runtime preflight directory"
+tar -xzf "$PKG" -C "$T" || stop "could not unpack the package for runtime compatibility checking"
+RUNTIME_PREFLIGHT="$(dirname "$INSTALLER")/nullmoth-runtime-check.sh"
+[ -x "$RUNTIME_PREFLIGHT" ] || stop "the runtime compatibility checker is missing from the app"
+/bin/bash "$RUNTIME_PREFLIGHT" "$T/pkgroot" "$(sw_vers -productVersion)" || stop "the userland runtime cannot load on this macOS version; EFI and driver files were not changed"
+rm -rf "$T"; T=""
 fi
 
 if [ -n "$CFG" ]; then C=$CFG; [ -f "$C" ] || stop "no config at $C"; MP=$(cd "$(dirname "$C")/../.." && pwd); OCREL="EFI/$(basename "$(dirname "$C")")"; ok "OpenCore config: $C (given)"
 else
   step "Finding the OpenCore partition"
   if [ "$EFI" = auto ]; then
-    found=""
-    if d=$(booted_part); then mp=$(mount_efi "$d") && [ -n "$(ocrel_in "$mp")" ] && { found=$d; ok "OpenCore started this Mac from $d"; }; fi
+    found=""; BOOT_BOUND=0
+    if d=$(booted_part); then mount_efi "$d" && mp=$MOUNT_POINT && [ -n "$(ocrel_in "$mp")" ] && { found=$d; BOOT_BOUND=1; ok "OpenCore started this Mac from $d"; }; fi
     if [ -z "$found" ]; then
       # OpenCore can live on an EFI partition or on any FAT32 partition (a 1401 stick is a FAT32 data partition)
       for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
-        mp=$(mount_efi "$d") || continue; [ -n "$(ocrel_in "$mp")" ] && found="$found $d"; done
+        mount_efi "$d" || continue; mp=$MOUNT_POINT; [ -n "$(ocrel_in "$mp")" ] && found="$found $d"; done
     fi
     n=$(echo $found | wc -w | tr -d ' ')
     if [ "$n" = 0 ]; then
-      # ⛔ 10-07 (NM-HNQ1JK7A, an iMac20,1): the stop said only "no OpenCore config" - not whether the Mac runs Clover or
+      # 10-07 (NM-HNQ1JK7A, an iMac20,1): the stop said only "no OpenCore config" - not whether the Mac runs Clover or
       # whether a config for ANOTHER model was there. Say what each partition holds, so the user (and the report) can tell.
       clover=""; for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
-        mp=$(mount_efi "$d") || { echo "NOTE $d: could not be mounted"; continue; }
+        mount_efi "$d" || { echo "NOTE $d: could not be mounted"; continue; }; mp=$MOUNT_POINT
         [ -d "$mp/EFI/CLOVER" ] && { clover=1; echo "NOTE $d: Clover (EFI/CLOVER)"; }
         for c in "$mp/EFI/OC/config.plist" "$mp/EFI/BOOT/config.plist"; do [ -f "$c" ] || continue
           cm=""; for k in PlatformInfo.Generic.SystemProductName PlatformInfo.SMBIOS.SystemProductName PlatformInfo.DataHub.SystemProductName; do
@@ -168,31 +314,25 @@ else
         stop "this Mac starts with Clover, not OpenCore - the NVIDIA driver's settings are made for OpenCore. Make an OpenCore setup (1401 on Windows builds one), start from it, then run this again"
       stop "no OpenCore config for this Mac ($(sysctl -n hw.model)) on any connected disk - plug in the disk or USB stick OpenCore started from, then try again (the NOTE lines above show what each partition holds)"
     fi
-    if [ "$n" -gt 1 ]; then be=$(boot_esp); for d in $found; do [ "$d" = "$be" ] && { found=$d; n=1; ok "using the OpenCore on this Mac's own drive ($d)"; }; done; fi
-    [ "$n" -gt 1 ] && { for d in $found; do echo "NOTE candidate $d"; done; stop "several OpenCore partitions found - pick one"; }
+    # A shared SMBIOS model or the macOS disk does not identify the booted EFI.
+    # Retain candidate discovery, but require explicit selection without boot-path proof.
+    if [ "$BOOT_BOUND" != 1 ]; then
+      for d in $found; do echo "NOTE candidate $d"; done
+      stop "OpenCore's startup partition could not be confirmed - select the partition this Mac started from"
+    fi
     EFI=${found# }
   fi
-  MP=$(mount_efi "$EFI") || stop "could not mount $EFI"
+  mount_efi "$EFI" || stop "could not mount $EFI"; MP=$MOUNT_POINT
   OCREL=$(ocrel_in "$MP"); [ -n "$OCREL" ] || stop "$EFI has no OpenCore config (EFI/OC/config.plist or EFI/BOOT/config.plist)"
   C="$MP/$OCREL/config.plist"
   ok "OpenCore config: $EFI ($C)"
-  # The OpenCore 1401 built for this PC lives on the stick it installed macOS from. Once macOS runs, it belongs on the
-  # Mac's own drive, so the Mac starts without the stick and every later change lands there. (10-07: a fresh install's
-  # EFI partition was empty, so the Mac could only start from the stick.) A drive that already has OpenCore is left alone.
-  BE=$(boot_esp)
-  if [ $DRY = 0 ] && [ -z "$VERB" ] && [ "${UPD:-}" != finish ] && [ -n "$BE" ] && [ "$BE" != "$EFI" ] && on_usb "$EFI"; then
-    BMP=$(mount_efi "$BE") || stop "could not mount this Mac's EFI partition $BE"
-    if [ -z "$(ocrel_in "$BMP")" ]; then
-      step "Copying this PC's OpenCore from the stick onto the Mac's own drive"
-      mkdir -p "$ST"; EB="$ST/efi-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-      [ -d "$BMP/EFI" ] && { tar -czf "$EB" -C "$BMP" EFI || stop "could not back up $BE's EFI folder"; ok "backed up the drive's old EFI folder to $EB"; }
-      rm -rf "$BMP/EFI.nullmoth-new"; ditto "$MP/EFI" "$BMP/EFI.nullmoth-new" || { rm -rf "$BMP/EFI.nullmoth-new"; stop "could not copy OpenCore to $BE (is the partition full?)"; }
-      [ "$(shasum -a 256 "$BMP/EFI.nullmoth-new/${OCREL#EFI/}/config.plist" | cut -c1-64)" = "$(shasum -a 256 "$C" | cut -c1-64)" ] || { rm -rf "$BMP/EFI.nullmoth-new"; stop "the copied config does not match the stick's - nothing changed"; }
-      rm -rf "$BMP/EFI.nullmoth-old"; [ -d "$BMP/EFI" ] && mv "$BMP/EFI" "$BMP/EFI.nullmoth-old"; mv "$BMP/EFI.nullmoth-new" "$BMP/EFI" && rm -rf "$BMP/EFI.nullmoth-old"
-      EFI=$BE; MP=$BMP; C="$MP/$OCREL/config.plist"
-      ok "OpenCore is now on this Mac's drive ($BE) - the Mac starts without the stick; changes go to $C"
-    fi
+  # Installation uses the verified or explicitly selected startup partition.
+  # Implicit migration cannot establish ownership of another disk's boot files.
+  if [ $DRY = 0 ] && [ -z "$VERB" ] && [ "${UPD:-}" != finish ] && on_usb "$EFI"; then
+    note "OpenCore remains on the selected startup stick. Keep it attached for every restart; automatic copying onto another EFI partition is disabled"
+    note "Existing internal Windows and vendor boot files were left untouched. Review the internal boot setup separately before removing the stick"
   fi
+
 fi
 plutil -lint "$C" >/dev/null || stop "$C is not a valid plist - fix it before installing"
 
@@ -260,7 +400,7 @@ PL
     else do_prepare; cleanup; echo "RESULT ok"; exit 0; fi;;
   finish|cancel)
     . "$PEND" 2>/dev/null
-    if [ "$UPD" = finish ] && [ "${FROM:-}" = "$MAJ" ]; then echo "$(date) still on macOS $MAJ - waiting for the update"; cleanup; echo "RESULT ok"; exit 0; fi
+    if [ "$UPD" = finish ] && [ "${FROM:-}" = "$MAJ" ] && [ "$MAJ" = 15 ]; then echo "$(date) still on macOS $MAJ - waiting for the update"; cleanup; echo "RESULT ok"; exit 0; fi
     step "Setting the driver up for macOS $MAJ"; backup   # only once the update has happened: no backup per waiting boot
     if [ -d "/Library/NullMoth/kexts/$MAJ/NVAccel.kext" ]; then
       rm -rf /Library/Extensions/NVAccel.kext && ditto "/Library/NullMoth/kexts/$MAJ/NVAccel.kext" /Library/Extensions/NVAccel.kext
@@ -290,7 +430,7 @@ fi
 
 if [ -n "$USBMAP" ]; then
   step "Installing the USB map"
-  # ⛔ 10-07 (NM-HZTKJHPZ): 1401 Mac 1.0.1 passed the .kext itself, so "$USBMAP/UTBMap.kext" never existed and every map
+  # 10-07 (NM-HZTKJHPZ): 1401 Mac 1.0.1 passed the .kext itself, so "$USBMAP/UTBMap.kext" never existed and every map
   # stopped as "not valid". Take the folder holding the kext or the kext itself.
   case "$USBMAP" in */UTBMap.kext|*/UTBMap.kext/) K="${USBMAP%/}";; *) K="$USBMAP/UTBMap.kext";; esac
   [ -f "$K/Contents/Info.plist" ] || stop "the USB map the app wrote is missing ($K)"
@@ -317,7 +457,7 @@ if [ $DRY = 0 ]; then
   T=$(mktemp -d /var/tmp/nullmoth.XXXX)
   tar -xzf "$PKG" -C "$T" || stop "could not unpack the package"
   [ -x "$T/pkgroot/install.sh" ] || stop "the package has no install.sh"
-  out=$(cd "$T/pkgroot" && CHECK=1 ./install.sh 2>&1); rc=$?
+  out=$(CHECK=1 /bin/bash "$INSTALLER" --payload "$T/pkgroot" 2>&1); rc=$?
   echo "$out" | sed -E '/^$/d;s/^== /NOTE /;s/^   ok  /NOTE /;s/^   STOP: /STOP /;s/^   NOTE: /NOTE /'
   [ "$rc" = 0 ] || stop "the driver test build failed (exit $rc) - OpenCore and macOS were not changed"
   rm -rf "$T"; T=""
@@ -348,6 +488,13 @@ bar=$(get UEFI.Quirks.ResizeGpuBars); abar=$(get Booter.Quirks.ResizeAppleGpuBar
 # 13 = 8 GB: the full BAR of an 8 GB card, measured 10-07 on the RTX 5060 (NVRM moves BAR1 out of the console, display armed).
 [ "$bar" != 13 ] && { echo "CHANGE ResizeGpuBars: ${bar:-unset} -> 13 (8 GB BAR, full memory bandwidth)"; EDITS+=("UEFI.Quirks.ResizeGpuBars|-integer|13"); }
 [ "$abar" != -1 ] && { echo "CHANGE ResizeAppleGpuBars: ${abar:-unset} -> -1 (macOS sees the full BAR)"; EDITS+=("Booter.Quirks.ResizeAppleGpuBars|-integer|-1"); }
+# boot.efi stops with STOP 0x16 (no room in low memory for the kernel) on some boards even with a valid custom slide, and
+# the full BAR set above moves memory around. AllowRelocationBlock loads the kernel through a scratch block in the lower
+# 4 GB and is used only when no slide fits (OpenCore Configuration, Booter > Quirks); it needs ProvideCustomSlide and
+# AvoidRuntimeDefrag, so it is only turned on where both are on.
+if [ "$(get Booter.Quirks.ProvideCustomSlide)" = true ] && [ "$(get Booter.Quirks.AvoidRuntimeDefrag)" = true ] && [ "$(get Booter.Quirks.AllowRelocationBlock)" != true ]; then
+  echo "CHANGE AllowRelocationBlock: on (boot.efi can still place the kernel when low memory is full)"; EDITS+=("Booter.Quirks.AllowRelocationBlock|-bool|true")
+fi
 # The installer runs on the firmware framebuffer (IONDRVSupport); once the driver is in, that framebuffer would take
 # display index 0 from NVRMFB, so the installed system excludes it (as on the tested RTX 5060 setup).
 NEEDBLOCK=0; bi=$(bidx)
@@ -364,6 +511,14 @@ if [ $SIPON = 1 ]; then
   EDITS=("${KEEP[@]+"${KEEP[@]}"}"); NEEDBLOCK=0
 fi
 if [ $DRY = 0 ]; then
+  mkdir -p "$ST" || stop "could not create the install state directory"
+  OLD_STATE="$ST/state.before-install"; HAD_STATE=0
+  if [ -f "$STATE" ]; then cp -p "$STATE" "$OLD_STATE" || stop "could not preserve the existing recovery record"; HAD_STATE=1; fi
+  UUID=""; [ -z "$CFG" ] && UUID=$(diskutil info "$EFI" | awk -F': *' '/Partition UUID/{print $2}')
+  if [ "$HAD_STATE" = 1 ]; then
+    inherited=$(owned_amfi_from_prior_record "$OLD_STATE" "$UUID" "$C" "$OCREL" "$(shasum -a 256 "$C" | awk '{print $1}')" "$(get NVRAM.Add.$B.boot-args)")
+    for a in $inherited; do case " $ADDED " in *" $a "*) ;; *) ADDED="$ADDED $a";; esac; done
+  fi
   BKC="$C.nullmoth-$(date +%Y%m%d-%H%M%S)"
   cp -p "$C" "$BKC" || stop "could not back up $C"
   ok "backed up the config to $BKC"
@@ -386,17 +541,20 @@ if [ $DRY = 0 ]; then
   fi
   if [ $fail = 1 ] || ! plutil -lint "$C" >/dev/null; then cp -p "$BKC" "$C"; stop "editing the config failed - the original is restored"; fi
   ok "OpenCore config updated"
-  UUID=""; [ -z "$CFG" ] && UUID=$(diskutil info "$EFI" | awk -F': *' '/Partition UUID/{print $2}')
   mkdir -p "$ST"
-  { echo "# NullMoth install record $(date -u +%Y-%m-%dT%H:%M:%SZ) - read by nullmoth-setup.sh --remove"
-    echo "EFI_UUID='$UUID'"; echo "OCREL='$OCREL'"; echo "CONFIG_BACKUP_REL='$OCREL/$(basename "$BKC")'"; echo "CONFIG_BACKUP='$BKC'"
-    echo "CONFIG_SHA_AFTER='$(shasum -a 256 "$C" | awk '{print $1}')'"
-    echo "ADDED_ARGS='${ADDED# }'"; echo "REMOVED_ARGS='${REMOVED# }'"
-    echo "OLD_CSR='$cur'"; echo "NEW_CSR='$want'"; echo "OLD_SBM='$OLDSBM'"; } > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+  { printf '# NullMoth install record %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '%s=%q\n' EFI_UUID "$UUID" CONFIG_PATH "$C" OCREL "$OCREL" CONFIG_BACKUP_REL "$OCREL/$(basename "$BKC")" CONFIG_BACKUP "$BKC" \
+      CONFIG_SHA_AFTER "$(shasum -a 256 "$C" | awk '{print $1}')" ADDED_ARGS "${ADDED# }" REMOVED_ARGS "${REMOVED# }" \
+      OLD_CSR "$cur" NEW_CSR "$want" OLD_SBM "$OLDSBM"
+  } > "$STATE.tmp" && chmod 600 "$STATE.tmp" && mv "$STATE.tmp" "$STATE" || {
+    cp -p "$BKC" "$C"
+    [ "$HAD_STATE" != 1 ] || cp -p "$OLD_STATE" "$STATE"
+    stop "could not save the install record - OpenCore changes restored"
+  }
 fi
 [ "${NULLMOTH_CONFIG_ONLY:-0}" = 1 ] && { cleanup; echo "RESULT ok"; exit 0; }
 if [ $SIPON = 1 ] && [ $DRY = 0 ]; then
-  rm -f "$STATE"
+  if [ "${HAD_STATE:-0}" = 1 ]; then cp -p "$OLD_STATE" "$STATE"; else rm -f "$STATE"; fi
   ok "SIP setting written - restart, then open 1401 again to install the driver"; cleanup; echo "RESULT ok"; exit 0
 fi
 
@@ -404,18 +562,44 @@ step "Installing the driver"
 T=$(mktemp -d /var/tmp/nullmoth.XXXX)
 tar -xzf "$PKG" -C "$T" || stop "could not unpack the package"
 [ -x "$T/pkgroot/install.sh" ] || stop "the package has no install.sh"
-if [ $DRY = 1 ]; then out=$(cd "$T/pkgroot" && CHECK=1 ./install.sh 2>&1); rc=$?
-else out=$(cd "$T/pkgroot" && ./install.sh 2>&1); rc=$?; fi
+if [ $DRY = 1 ]; then out=$(CHECK=1 /bin/bash "$INSTALLER" --payload "$T/pkgroot" 2>&1); rc=$?
+else out=$(/bin/bash "$INSTALLER" --payload "$T/pkgroot" 2>&1); rc=$?; fi
 echo "$out" | sed -E '/^$/d;s/^== /NOTE /;s/^   ok  /NOTE /;s/^   STOP: /STOP /;s/^   NOTE: /NOTE /'
 if [ "$rc" != 0 ]; then
-  [ $DRY = 0 ] && [ -n "${BKC:-}" ] && [ -f "$BKC" ] && cp -p "$BKC" "$C" && rm -f "$STATE" && note "OpenCore config put back as it was before"
+  [ $DRY = 0 ] && [ -n "${BKC:-}" ] && [ -f "$BKC" ] && cp -p "$BKC" "$C" && note "OpenCore config put back as it was before"
+  if [ $DRY = 0 ]; then
+    if [ "${HAD_STATE:-0}" = 1 ]; then cp -p "$OLD_STATE" "$STATE" || stop "could not restore the previous recovery record"
+    else rm -f "$STATE"; fi
+  fi
   stop "the driver installer stopped (exit $rc)"
 fi
 if [ $DRY = 1 ]; then ok "dry run: the driver would install cleanly (nothing was changed)"; cleanup; echo "RESULT ok"; exit 0; fi
 
-mkdir -p $ST && cp "$T/pkgroot/uninstall.sh" $ST/ && chmod 755 $ST/uninstall.sh
+UNINSTALLER="$(dirname "$INSTALLER")/nullmoth-uninstall.sh"
+[ -x "$UNINSTALLER" ] && mkdir -p "$ST" && cp "$UNINSTALLER" "$ST/uninstall.sh" && chmod 755 "$ST/uninstall.sh" || stop "could not save the audited recovery uninstaller"
 DBK=$(echo "$out" | sed -n 's/^Undo: sudo .\/uninstall.sh //p' | tail -1)
-echo "DRIVER_BACKUP='$DBK'" >> "$STATE"
+printf '%s=%q\n' DRIVER_BACKUP "$DBK" >> "$STATE" || stop "could not record the driver backup"
+# per-system rules (nullmoth-rules.json, picked by the app from this machine's profile): their knobs go in a marked
+# block of the driver's knob file, which install.sh has just written fresh. Only NVMTL_/NVK_/NVRM_ keys with plain values.
+CONF=/Library/GPUBundles/nvmtl/nvrm610.conf
+if [ -f "$CONF" ]; then
+  sed -i '' '/^# --- 1401 per-system rules ---$/,/^# --- end 1401 per-system rules ---$/d' "$CONF"
+  if [ ${#KNOBS[@]} -gt 0 ]; then
+    { echo "# --- 1401 per-system rules ---"
+      for kv in "${KNOBS[@]}"; do
+        if [[ "$kv" =~ ^(NVMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._-]{0,64}$ ]]; then echo "$kv"; note "per-system rule: $kv" >&2
+        else echo "NOTE refused per-system knob '$kv' (not a driver knob)" >&2; fi
+      done
+      echo "# --- end 1401 per-system rules ---"; } >> "$CONF"
+  fi
+fi
+if [ -n "$PROFILE" ] && [ -f "$PROFILE" ]; then
+  cp "$PROFILE" "$ST/system-profile.json.tmp" && chmod 644 "$ST/system-profile.json.tmp" && mv "$ST/system-profile.json.tmp" "$ST/system-profile.json"
+  rm -f "$PROFILE"
+fi
+# the version the app compares with the newest release ("Update driver"); world-readable, the app runs as the user
+DV=$(basename "$PKG" | sed -n 's/^nullmoth-nvidia-\([0-9][0-9.]*\)\.tar\.gz$/\1/p')
+[ -n "$DV" ] && { echo "$DV" > "$ST/driver-version.tmp" && chmod 644 "$ST/driver-version.tmp" && mv "$ST/driver-version.tmp" "$ST/driver-version"; }
 ok "install record written to $STATE"
 if [ -n "$APPBIN" ] && [ -x "$APPBIN" ]; then
   cat > "$AGENT" <<PL
@@ -436,8 +620,9 @@ cat > "$ST/nullmoth-recover.sh" <<'RS'
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 V=7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove
 nvram "$V" >/dev/null 2>&1 || exit 0
-nvram -d "$V"
 { date; /bin/bash /Library/NullMoth/nullmoth-setup.sh --remove; } >> /Library/NullMoth/recover.log 2>&1
+rc=$?; [ "$rc" = 0 ] || exit "$rc"
+nvram -d "$V" || exit 1
 sleep 2; /sbin/shutdown -r now
 RS
 chmod 755 "$ST/nullmoth-recover.sh"

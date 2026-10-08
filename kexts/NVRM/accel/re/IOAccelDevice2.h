@@ -95,7 +95,7 @@ public:
     /*
      * Reserved padding, slots 305..310. Six, exactly.
      *
-     * ⚠️ The argument is "IOAccelDevice", NOT "IOAccelDevice2". The macro pastes
+     * The argument is "IOAccelDevice", NOT "IOAccelDevice2". The macro pastes
      * className ## index, and the shipping binary exports
      * __ZN14IOAccelDevice223_RESERVEDIOAccelDevice0Ev — i.e. the method is
      * named _RESERVEDIOAccelDevice0. Passing the class's own name yields

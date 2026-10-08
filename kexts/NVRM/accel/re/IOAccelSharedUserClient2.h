@@ -16,7 +16,7 @@
  *                IOExternalMethod[21] — length proved by the next defined
  *                symbol landing at exactly table + 21*48.
  *
- * ⚠️ VTABLE ORDER DIFFERS FROM IOAccelDevice2. Here the six reserved slots come
+ * VTABLE ORDER DIFFERS FROM IOAccelDevice2. Here the six reserved slots come
  * FIRST (302..307) and the two new virtuals come AFTER them (308, 309). In
  * IOAccelDevice2 the new virtuals come first and the reserved slots trail. Do
  * not assume a house style — read each class's vtable. Getting this backwards
@@ -92,7 +92,7 @@ public:
 
     /*
      * --- new virtuals ------------------------------------ slots 302..309
-     * ⚠️ RESERVED SLOTS COME FIRST HERE. Opposite of IOAccelDevice2.
+     * RESERVED SLOTS COME FIRST HERE. Opposite of IOAccelDevice2.
      * Base name is "IOAccelSharedUserClient" — no trailing 2 — because the
      * macro pastes className ## index and the binary exports
      * __ZN24IOAccelSharedUserClient223_RESERVEDIOAccelSharedUserClient0Ev.

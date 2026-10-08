@@ -4597,7 +4597,20 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
        image->planes[plane].plane_align_B = plane_align_B;
        image->image_align_B = MAX2(plane_align_B, image->image_align_B);
  
-@@ -1186,6 +1322,15 @@
+@@ -1161,6 +1297,12 @@
+          plane_offset_B = align64(plane_offset_B, plane_align_B);
+          image->planes[plane].plane_offset_B = plane_offset_B;
+          plane_offset_B += image->planes[plane].nil.size_B;
++         /* A plane with a PTE kind is bound through its own VA of align(nil.size_B, plane_align_B) bytes, and the
++          * 64 KB rule above makes that range longer than nil.size_B. Sized without the round-up, binding the image to
++          * memory of exactly the reported size asserted mem_offset_B + range_B <= mem->size_B (RTX 3050, resolution
++          * change). Size the plane like its VA. Blackwell (3D class 0xCD97 and later) keeps the size it shipped with. */
++         if (image->planes[plane].nil.pte_kind && !sparse_bound && pdev->info.cls_eng3d < 0xCD97)
++            plane_offset_B = align64(plane_offset_B, plane_align_B);
+          image->image_size_B = plane_offset_B;
+       }
+    }
+@@ -1186,6 +1328,15 @@
                                    image->image_align_B);
     }
  
@@ -4613,7 +4626,7 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
     return VK_SUCCESS;
  }
  
-@@ -1633,7 +1778,11 @@
+@@ -1633,7 +1784,11 @@
     const bool not_shared = !(mem->mem->flags & NVKMD_MEM_SHARED);
  
     if (plane->nil.pte_kind != 0) {
@@ -8046,7 +8059,7 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
 diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --exclude=__pycache__ --exclude=*.bak* --exclude=*.orig --exclude=.git --exclude=open-gpu-kernel-modules --strip-trailing-cr upmesa/mesa-17ca6174/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c rebase263/mesa/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c
 --- a/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	1969-12-31 16:00:00
 +++ b/src/nouveau/vulkan/nvkmd/nvrm/nvkmd_nvrm_ctx.c	2026-10-05 15:58:51
-@@ -0,0 +1,1281 @@
+@@ -0,0 +1,1322 @@
 +
 +
 +
@@ -8073,6 +8086,8 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
 +#include "class/clc361.h"
 +#include "class/clc46f.h"
 +#include "class/cl2080_notification.h"
++#include "class/clb0b5sw.h" // NVB0B5_ALLOCATION_PARAMETERS (copy engine instance)
++#include "ctrl/ctrl2080/ctrl2080gpu.h" // NV2080_CTRL_CMD_GPU_GET_ENGINE_PARTNERLIST
 +#include "class/clc36f.h"
 +#include "class/cla16f.h"
 +#include "class/cl0005.h"
@@ -8647,9 +8662,10 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
 +
 +
 +static VkResult
-+nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
++nvkmd_nvrm_create_exec_ctx_on(struct nvkmd_dev *_dev,
 +                              struct vk_object_base *log_obj,
 +                              enum nvkmd_engines engines,
++                              bool allowCe,
 +                              struct nvkmd_ctx **ctx_out)
 +{
 +   struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_dev);
@@ -8687,7 +8703,7 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
 +
 +
 +
-+   ctx->ceOnly = engines == NVKMD_ENGINE_COPY && nvrm610_on("CECHAN");
++   ctx->ceOnly = allowCe && engines == NVKMD_ENGINE_COPY && nvrm610_on("CECHAN");
 +   NvU32 engineType = ctx->ceOnly ? NV2080_ENGINE_TYPE_COPY4 : NV2080_ENGINE_TYPE_GRAPHICS;
 +   NvHandle chanParent = pdev->hDevice;
 +   if (!ctx->ceOnly && nvrm610_on("TSG")) {
@@ -8762,7 +8778,27 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
 +		sizeof(tokenParams)
 +	));
 +
-+   NV_CHECK(nvRmApiAlloc(&rm, ctx->hChannel, &ctx->subchannels.hCopy, pdev->base.dev_info.cls_copy, NULL));
++   /* GTX 1650 (TU117), 10-07: the copy object on a GRAPHICS channel failed here (VK_ERROR_UNKNOWN) and no queue came up.
++    * Ampere+ RM pairs a CE object on a GR channel with the GR engine's partner CE itself (channel_descendant.c, "GRCE
++    * case"); Turing takes the legacy path, where the CE engine comes from NVB0B5_ALLOCATION_PARAMETERS
++    * (kceGetEngineDescFromAllocParams) and NULL params leave RM no engine. Name the partner CE the way RM does on
++    * Ampere (NV2080_CTRL_CMD_GPU_GET_ENGINE_PARTNERLIST). Ampere and later ignore these params. */
++   /* 10-07: passing the partner CE first changed the copy path on the RTX 5060 (screen 2, which WindowServer fills by
++    * copies, went black then flickered). The pre-10-07 call stays FIRST, so every card that works keeps it unchanged;
++    * the partner CE is only the retry, for Turing, where the plain call is refused. */
++   NV_STATUS cs = nvRmApiAlloc(&rm, ctx->hChannel, &ctx->subchannels.hCopy, pdev->base.dev_info.cls_copy, NULL);
++   if (cs != NV_OK && !ctx->ceOnly) {
++      NV2080_CTRL_GPU_GET_ENGINE_PARTNERLIST_PARAMS pl = { .engineType = NV2080_ENGINE_TYPE_GRAPHICS,
++                                                           .partnershipClassId = pdev->base.dev_info.cls_copy, .runqueue = 0 };
++      NV_STATUS ps = nvRmApiControl(&rm, pdev->hSubdevice, NV2080_CTRL_CMD_GPU_GET_ENGINE_PARTNERLIST, &pl, sizeof(pl));
++      fprintf(stderr, "nvrm: copy object on the graphics channel refused rc 0x%x - partner CE lookup rc 0x%x, %u partner(s)\n",
++              (unsigned)cs, (unsigned)ps, (unsigned)pl.numPartners);
++      if (ps == NV_OK && pl.numPartners >= 1) {
++         NVB0B5_ALLOCATION_PARAMETERS ceParams = { .version = NVB0B5_ALLOCATION_PARAMETERS_VERSION_1, .engineType = pl.partnerList[0] };
++         cs = nvRmApiAlloc(&rm, ctx->hChannel, &ctx->subchannels.hCopy, pdev->base.dev_info.cls_copy, &ceParams);
++      }
++   }
++   NV_CHECK(cs);
 +   if (!ctx->ceOnly) {
 +   NV_CHECK(nvRmApiAlloc(&rm, ctx->hChannel, &ctx->subchannels.hEng2d, pdev->base.dev_info.cls_eng2d, NULL));
 +   NV_CHECK(nvRmApiAlloc(&rm, ctx->hChannel, &ctx->subchannels.hEng3d, pdev->base.dev_info.cls_eng3d, NULL));
@@ -8875,6 +8911,24 @@ diff -ruN --exclude=subprojects --exclude=ci --exclude=build* --exclude=*.pyc --
 +error:
 +   nvkmd_ctx_destroy(&ctx->base);
 +	return vkRes;
++}
++
++/* RTX 3060 Ti (GA104): RM created the COPY4 channel and then refused the copy object on it ("bad class 0xc7b5"), so
++ * every vkCreateDevice failed. COPY4 is the async copy engine NVIDIA's driver uses on Blackwell; copy engine numbering
++ * and the classes each one exposes differ per chip. When the copy-engine context cannot be built on this GPU, build the
++ * copy queue on a graphics channel instead, which every chip runs. */
++static VkResult
++nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
++                              struct vk_object_base *log_obj,
++                              enum nvkmd_engines engines,
++                              struct nvkmd_ctx **ctx_out)
++{
++   VkResult r = nvkmd_nvrm_create_exec_ctx_on(_dev, log_obj, engines, true, ctx_out);
++   if (r != VK_SUCCESS && engines == NVKMD_ENGINE_COPY && nvrm610_on("CECHAN")) {
++      fprintf(stderr, "nvrm: copy-engine queue could not be built on this GPU (VkResult %d) - copy queue on a graphics channel\n", (int)r);
++      r = nvkmd_nvrm_create_exec_ctx_on(_dev, log_obj, engines, false, ctx_out);
++   }
++   return r;
 +}
 +
 +

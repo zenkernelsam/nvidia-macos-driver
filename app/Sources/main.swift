@@ -6,12 +6,13 @@ import CryptoKit
 import IOKit
 import Metal
 import WebKit
+import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "1.0.1"
-    static let name = "nullmoth-nvidia-1.0.1.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.0.1/nullmoth-nvidia-1.0.1.tar.gz")!
-    static let sha256 = "69c07055292d24b8fe1bb0dfbfa6ce4e4e4c9fe54b1bf25a05b765c9314acec0"
+    static let version = "1.0.11"
+    static let name = "nullmoth-nvidia-1.0.11.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.0.17/nullmoth-nvidia-1.0.11.tar.gz")!
+    static let sha256 = "75869a4c74e5b1ffd27f7193dd0f5b86c6033903dd52d4ba1d268990dc003ff3"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -40,8 +41,7 @@ func prop(_ e: io_registry_entry_t, _ k: String) -> Any? {
     IORegistryEntryCreateCFProperty(e, k as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
 }
 func u32(_ e: io_registry_entry_t, _ k: String) -> UInt32? {
-    guard let d = prop(e, k) as? Data, d.count >= 4 else { return (prop(e, k) as? NSNumber)?.uint32Value }
-    return d.withUnsafeBytes { $0.load(as: UInt32.self) }
+    HardwareMap.integer(prop(e, k), maximum: UInt64(UInt32.max)).map { UInt32($0) }
 }
 func str(_ e: io_registry_entry_t, _ k: String) -> String? {
     if let s = prop(e, k) as? String { return s }
@@ -71,7 +71,14 @@ func pciDisplays() -> [[String: Any]] {
     services("IOPCIDevice").compactMap { s in
         defer { IOObjectRelease(s) }
         guard let cls = u32(s, "class-code"), cls >> 16 == 0x03, let v = u32(s, "vendor-id"), let d = u32(s, "device-id") else { return nil }
-        return ["vendor": String(format: "%04X", v & 0xffff), "device": String(format: "%04X", d & 0xffff), "model": str(s, "model") ?? ""]
+        var path = [CChar](repeating: 0, count: 512)
+        let located = IORegistryEntryGetPath(s, kIOServicePlane, &path) == KERN_SUCCESS
+        var identity = Profile.displayIdentity(vendor: v, device: d,
+                                               subsystemVendor: u32(s, "subsystem-vendor-id"),
+                                               subsystemDevice: u32(s, "subsystem-id"),
+                                               path: located ? String(cString: path) : "")
+        identity["model"] = str(s, "model") ?? ""
+        return identity
     }
 }
 
@@ -90,40 +97,60 @@ func usbControllers() -> [[String: Any]] {
                 let devs = children(p).filter { className($0).contains("USB") && className($0).contains("Device") || className($0) == "IOUSBHostDevice" }
                 let names = devs.map { str($0, "USB Product Name") ?? str($0, "kUSBProductString") ?? regName($0) }
                 ports.append(["name": regName(p), "port": Int(u32(p, "port") ?? 0), "usb3": cls.contains("30"),
-                              "connector": Int(u32(p, "UsbConnector") ?? 255), "devices": names,
+                              "connector": Int(u32(p, "UsbConnector") ?? 255), "connectorKnown": u32(p, "UsbConnector") != nil, "devices": names,
                               "comment": str(p, "#comment") ?? ""])
                 devs.forEach { IOObjectRelease($0) }
             }
             IOObjectRelease(p)
         }
-        out.append(["controller": regName(parent), "vendor": String(format: "%04X", ven), "device": String(format: "%04X", dev),
+        out.append(["controller": regName(parent), "key": String(cString: path), "vendor": String(format: "%04X", ven), "device": String(format: "%04X", dev),
                     "path": String(cString: path), "ports": ports.sorted { ($0["port"] as! Int) < ($1["port"] as! Int) }])
         IOObjectRelease(parent); IOObjectRelease(x)
     }
     return out
 }
 
+func usbControllerKey(_ c: [String: Any]) -> String {
+    let key = c["key"] as? String ?? ""
+    return key.isEmpty ? (c["controller"] as? String ?? "") : key
+}
+
 func utbMap(_ ctrls: [[String: Any]], _ sel: [String: [String: Int]]) -> ([String: Any]?, String?) {
     var pers: [String: Any] = [:]
-    var ids = Set<String>()
+    let keys = Set(ctrls.map(usbControllerKey))
+    if sel.contains(where: { !keys.contains($0.key) && !$0.value.isEmpty }) { return (nil, "A selected USB controller is no longer present. Scan again.") }
+    var matches = Set<String>()
     for c in ctrls {
         let name = c["controller"] as! String
-        guard let chosen = sel[name], !chosen.isEmpty else { continue }
+        let key = usbControllerKey(c)
+        guard let chosen = sel[key], !chosen.isEmpty else { continue }
         if chosen.count > 15 { return (nil, "\(name) has \(chosen.count) ports picked; macOS allows 15 per controller. Untick some.") }
         let id = "0x\(c["device"]!)\(c["vendor"]!)"
-        if ids.contains(id) { return (nil, "Two USB controllers share the PCI id \(id); this mapper cannot tell them apart yet.") }
-        ids.insert(id)
+        let path = c["path"] as? String ?? ""
+        let sameId = ctrls.filter { "0x\($0["device"]!)\($0["vendor"]!)" == id }.count
+        if sameId > 1 && path.isEmpty { return (nil, "USB controllers share the PCI id \(id), but their registry paths are unavailable. Scan again.") }
+        let match = path.isEmpty ? id : path
+        if !matches.insert(match).inserted { return (nil, "Two selected USB controllers have the same identity. Scan again.") }
         var ports: [String: Any] = [:]
+        var highest: UInt32 = 0
+        var numbers = Set<UInt32>()
         for p in c["ports"] as! [[String: Any]] {
             let pn = p["name"] as! String
             guard let conn = chosen[pn] else { continue }
-            var n = UInt32(p["port"] as! Int).littleEndian
+            guard let number = p["port"] as? Int, number > 0, let value = UInt32(exactly: number), numbers.insert(value).inserted,
+                  [0, 3, 9, 10, 255].contains(conn) else { return (nil, "\(name) has an invalid port or connector selection. Scan again.") }
+            highest = max(highest, value)
+            var n = value.littleEndian
             ports[pn] = ["port": Data(bytes: &n, count: 4), "UsbConnector": conn,
                          "#comment": ((p["devices"] as? [String]) ?? []).joined(separator: ", ")]
         }
-        pers[name] = ["CFBundleIdentifier": "com.dhinakg.USBToolBox.kext", "IOClass": "USBToolBox", "IOMatchCategory": "USBToolBox",
+        if ports.count != chosen.count { return (nil, "Some selected ports on \(name) are no longer present. Scan again.") }
+        var top = highest.littleEndian
+        var personality: [String: Any] = ["CFBundleIdentifier": "com.dhinakg.USBToolBox.kext", "IOClass": "USBToolBox", "IOMatchCategory": "USBToolBox",
                       "IOPCIPrimaryMatch": id, "IOProviderClass": "IOPCIDevice",
-                      "IOProviderMergeProperties": ["ports": ports, "port-count": Data(bytes: [UInt8(ports.count), 0, 0, 0], count: 4)]]
+                      "IOProviderMergeProperties": ["ports": ports, "port-count": Data(bytes: &top, count: 4)]]
+        if !path.isEmpty { personality["IOPathMatch"] = path }
+        pers["Controller-\(pers.count)"] = personality
     }
     if pers.isEmpty { return (nil, "No ports picked.") }
     return (["CFBundleDevelopmentRegion": "English", "CFBundleIdentifier": "com.nullmoth.UTBMap", "CFBundleInfoDictionaryVersion": "6.0",
@@ -136,6 +163,24 @@ let crashDirs = ["/Library/Logs/DiagnosticReports", NSHomeDirectory() + "/Librar
 let seenFile = support.appendingPathComponent("crash-seen.json")
 
 let driverImages = ["NVMTLDriver", "libnvmtl_translate", "libvulkan_nouveau", "NVIDIAShared"]
+let supportCrashProcesses = ["firefox", "plugin-container", "Blender"]
+func supportCrashRank(_ name: String) -> Int? {
+    if name.hasPrefix("macos-WindowServer") { return 3 }
+    if supportCrashProcesses.contains(where: { name.lowercased().hasPrefix("macos-" + $0.lowercased() + "-") }) { return 3 }
+    return nil
+}
+
+func userApplicationCrashes() -> [URL] {
+    let fm = FileManager.default
+    let dir = URL(fileURLWithPath: crashDirs[1])
+    let files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+        .filter { $0.pathExtension == "ips" }
+        .sorted { ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >
+                  ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }
+    return supportCrashProcesses.compactMap { process in
+        files.first { $0.lastPathComponent.lowercased().hasPrefix(process.lowercased() + "-") }
+    }
+}
 func involvesDriver(_ u: URL) -> Bool {
     guard let t = try? String(contentsOf: u, encoding: .utf8) else { return false }
     let body = t.split(separator: "\n", maxSplits: 1).last.map(String.init) ?? t
@@ -174,10 +219,9 @@ func driverCrashes(sinceInstallOnly: Bool = true) -> [URL] {
 }
 
 func redact(_ s: String) -> String {
-    var t = s
     let user = NSUserName(), full = NSFullUserName()
+    let homes = [NSHomeDirectory(), URL(fileURLWithPath: "/Users").appendingPathComponent(user).path]
     var exact: [String: String] = [:]
-    exact[NSHomeDirectory()] = "/Users/user"; exact["/Users/\(user)"] = "/Users/user"
     for k in ["ComputerName", "LocalHostName", "HostName"] {
         let v = sh("/usr/sbin/scutil", ["--get", k]).trimmingCharacters(in: .whitespacesAndNewlines)
         if v.count > 2 { exact[v] = "this-mac" }
@@ -188,17 +232,7 @@ func redact(_ s: String) -> String {
     }
     if full.count > 2 { exact[full] = "user" }
     if user.count > 2 { exact[user] = "user" }
-    for (k, v) in exact.sorted(by: { $0.key.count > $1.key.count }) { t = t.replacingOccurrences(of: k, with: v) }
-    let rules: [(String, String)] = [
-        (#"/Users/[^/\s"']+"#, "/Users/user"),
-        (#"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b"#, "[uuid]"),
-        (#"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b"#, "[mac]"),
-        (#"\b(?:\d{1,3}\.){3}\d{1,3}\b"#, "[ip]"),
-        (#""(crashReporterKey|deviceIdentifierForVendor|sessionID|userID|incident|bootSessionUUID|sleepWakeUUID|serial[A-Za-z]*)"\s*:\s*"[^"]*""#, "\"$1\":\"[removed]\""),
-        (#"(?i)(serial number|system serial|hardware uuid|provisioning udid)[^\n]*"#, "$1: [removed]"),
-    ]
-    for (p, r) in rules { t = t.replacingOccurrences(of: p, with: r, options: .regularExpression) }
-    return t
+    return redactSupportText(s, homes: homes, identities: exact)
 }
 
 func hardwareFacts() -> String {
@@ -290,6 +324,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     var table: [String: Any] = [:]
     var seenUsb: [String: Set<String>] = [:]
     var usbTimer: Timer?
+    var usbGeneration = 0
 
     func applicationDidFinishLaunching(_ n: Notification) {
         let res = Bundle.main.resourceURL!
@@ -315,7 +350,26 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     }
 
     func send(_ event: String, _ data: Any) {
-        guard let j = try? JSONSerialization.data(withJSONObject: ["event": event, "data": data]),
+        var payload = data
+        let state = (data as? [String: Any])?["state"] as? String
+        if (["dl", "upd"].contains(event) && ["start", "error"].contains(state ?? "")) || event == "usbErr" {
+            do {
+                let directory = try SavedReports.session(in: logs.appendingPathComponent("Reports"))
+                let record: [String: Any] = ["event": event, "data": data,
+                    "app_version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unavailable",
+                    "helper_version": Package.version, "helper_sha256": Package.sha256,
+                    "os_version": ProcessInfo.processInfo.operatingSystemVersionString,
+                    "time": ISO8601DateFormatter().string(from: Date())]
+                _ = try SavedReports.create(Data(redact(json(record)).utf8), in: directory, name: "setup-" + event + ".txt")
+            } catch {
+                let warning = "The local operation report could not be saved: \(error.localizedDescription)"
+                if var fields = data as? [String: Any] {
+                    fields["why"] = ((fields["why"] as? String).map { $0 + " " } ?? "") + warning
+                    payload = fields
+                } else { payload = "\(data) \(warning)" }
+            }
+        }
+        guard let j = try? JSONSerialization.data(withJSONObject: ["event": event, "data": payload]),
               let s = String(data: j, encoding: .utf8) else { return }
         DispatchQueue.main.async { self.web.evaluateJavaScript("NM.on(\(s))") }
     }
@@ -325,7 +379,11 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         switch act {
         case "scan": DispatchQueue.global().async { self.send("scan", self.scan()) }
         case "download": download()
-        case "run": run(mode: b["mode"] as? String ?? "dry", pkg: b["pkg"] as? String ?? "", efi: b["efi"] as? String ?? "auto", extra: [])
+        case "checkUpdate": checkUpdate()
+        case "updateDriver": updateDriver(efi: b["efi"] as? String ?? "auto")
+        case "run":
+            guard let mode = AppActions.directRunMode(b["mode"]) else { return }
+            run(mode: mode, pkg: b["pkg"] as? String ?? "", efi: b["efi"] as? String ?? "auto", extra: [])
         case "restart": NSAppleScript(source: "tell application \"System Events\" to restart")?.executeAndReturnError(nil)
         case "privacy": NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Security")!)
         case "logs": try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true); NSWorkspace.shared.open(logs)
@@ -335,10 +393,8 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "usbWrite": usbWrite(b["sel"] as? [String: [String: Int]] ?? [:], efi: b["efi"] as? String ?? "auto")
         case "crashReport": crashReportFromWindow()
         case "sendLogs": sendLogs()
-        case "osupdate":
-            if b["cancel"] as? Bool ?? false { run(mode: "update", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--update", "cancel"]) }
-            else { run(mode: "tahoe", pkg: b["pkg"] as? String ?? "", efi: b["efi"] as? String ?? "auto", extra: ["--update", "prepare"]) }   // installs or updates the driver, then prepares
-        case "swupdate": NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension")!)
+        case "optionalDiagnostics": optionalDiagnostics()
+        case "importDiagnosticReceipt": importDiagnosticReceipt()
         case "verbose": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--verbose", (b["on"] as? Bool ?? false) ? "on" : "off"])
         default: break
         }
@@ -369,7 +425,47 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
                 "gpus": gpus, "opencore": oc, "kexts": kexts, "files": files, "metal": MTLCopyAllDevices().map { $0.name },
                 "packages": findPackages(), "version": Package.version, "safemode": safe,
                 "record": fm.fileExists(atPath: "/Library/NullMoth/state"), "crashes": driverCrashes().map(\.lastPathComponent),
-                "translated": sysctl("sysctl.proc_translated") == "1"]
+                "translated": sysctl("sysctl.proc_translated") == "1",
+                "profile": { var p = machineProfile(gpus); p["rules"] = Profile.select(rules(), p).ids; return p }()]
+    }
+
+    static func rules() -> [String: Any] {
+        guard let d = try? Data(contentsOf: Bundle.main.resourceURL!.appendingPathComponent("nullmoth-rules.json")),
+              let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return [:] }
+        return j
+    }
+    /// Live properties select per-system rules. Attached Windows profiles are
+    /// diagnostic evidence until their identity is bound to this boot configuration.
+    static func machineProfile(_ gpus: [[String: Any]]) -> [String: Any] {
+        var p: [String: Any] = [:]
+        if let nv = gpus.first(where: { $0["vendor"] as? String == "10DE" }), let dev = nv["device"] as? String {
+            p["gpu_id"] = dev.uppercased(); p["arch"] = Profile.arch(dev)
+        }
+        let vendor = sysctl("machdep.cpu.vendor")
+        p["cpu_vendor"] = vendor.contains("AMD") ? "amd" : vendor.contains("Intel") ? "intel" : vendor
+        p["cpu"] = sysctl("machdep.cpu.brand_string")
+        let bat = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        var installed: Bool? = nil
+        if bat != 0 {
+            if let value = prop(bat, "BatteryInstalled") as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() {
+                installed = value.boolValue
+            }
+            IOObjectRelease(bat)
+        }
+        Profile.attachChassisEvidence(servicePresent: bat != 0, batteryInstalled: installed, to: &p)
+        p["egpu"] = Profile.nvidiaBehindThunderbolt()
+        p["macos_major"] = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        p["gpu_candidates"] = gpus
+        p["gpu_rule_selection"] = gpus.filter { $0["vendor"] as? String == "10DE" }.count > 1 ? "first_registry_device_multiple_present" : "single_registry_device"
+        var windowsProfiles: [[String: Any]] = []
+        for v in ((try? FileManager.default.contentsOfDirectory(atPath: "/Volumes")) ?? []).sorted() {
+            if let d = try? Data(contentsOf: URL(fileURLWithPath: "/Volumes/\(v)/NullMoth/system-profile.json")),
+               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                windowsProfiles.append(j)
+            }
+        }
+        Profile.attachWindowsDiagnostics(windowsProfiles, to: &p)
+        return p
     }
 
     static func findPackages() -> [[String: String]] {
@@ -383,28 +479,105 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         }
     }
 
-    func download() {
-        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-        URLSession(configuration: .default, delegate: self, delegateQueue: nil).downloadTask(with: Package.url).resume()
+    // "Update driver": the newest driver release, not the version this app was built with. The package is checked against
+    // the SHA256SUMS.txt published in the same release and installed by the normal install path (backup, OpenCore checks).
+    struct DownloadPlan {
+        let name: String
+        let sha: String
+        let efi: String?
+    }
+    var pendingDownload: (id: Int, plan: DownloadPlan)? = nil
+    var runningSetup = false
+    lazy var downloadSession = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
+    var latest: (version: String, name: String, url: URL, sha: String)? = nil
+    static func releaseDriverVersion(_ name: String) -> String? {
+        guard let match = name.range(of: #"^nullmoth-nvidia-([0-9]+\.[0-9]+(?:\.[0-9]+)?)\.tar\.gz$"#, options: .regularExpression) else { return nil }
+        return String(name[match].dropFirst("nullmoth-nvidia-".count).dropLast(".tar.gz".count))
+    }
+    static func versionKey(_ v: String) -> [Int] { v.split(separator: ".").map { Int($0) ?? 0 } }
+    static func newer(_ a: String, than b: String) -> Bool {
+        let x = versionKey(a), y = versionKey(b)
+        for i in 0..<max(x.count, y.count) { let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0; if p != q { return p > q } }
+        return false
+    }
+    func installedDriverVersion() -> String {
+        (try? String(contentsOfFile: "/Library/NullMoth/driver-version", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    func checkUpdate() {
+        let api = URL(string: "https://api.github.com/repos/nullmoth/nvidia-macos-driver/releases/latest")!
+        var rq = URLRequest(url: api); rq.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept"); rq.timeoutInterval = 30
+        URLSession.shared.dataTask(with: rq) { data, resp, err in
+            let fail: (String) -> Void = { self.send("upd", ["state": "error", "why": $0]) }
+            guard err == nil, (resp as? HTTPURLResponse)?.statusCode == 200, let data,
+                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let assets = j["assets"] as? [[String: Any]] else { return fail("could not reach the release list (\(err?.localizedDescription ?? "HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))") }
+            var pkg: (String, String, URL)? = nil; var sums: URL? = nil
+            for a in assets {
+                guard let n = a["name"] as? String, let u = (a["browser_download_url"] as? String).flatMap(URL.init(string:)), u.scheme == "https" else { continue }
+                if n == "SHA256SUMS.txt" { sums = u }
+                if let version = App.releaseDriverVersion(n), pkg == nil || App.newer(version, than: pkg!.0) {
+                    pkg = (version, n, u)
+                }
+            }
+            guard let pkg, let sums else { return fail("the latest release has no driver package or no SHA256SUMS.txt") }
+            URLSession.shared.dataTask(with: sums) { sd, sr, se in
+                guard se == nil, (sr as? HTTPURLResponse)?.statusCode == 200, let sd, let txt = String(data: sd, encoding: .utf8) else { return fail("could not read SHA256SUMS.txt") }
+                let sha = txt.split(separator: "\n").compactMap { l -> String? in
+                    let f = l.split(whereSeparator: { $0 == " " || $0 == "\t" }); return f.count >= 2 && f.last.map(String.init) == pkg.1 ? String(f[0]).lowercased() : nil }.first ?? ""
+                guard sha.count == 64 else { return fail("SHA256SUMS.txt does not list \(pkg.1)") }
+                DispatchQueue.main.async { self.latest = (pkg.0, pkg.1, pkg.2, sha) }
+                let have = self.installedDriverVersion()
+                self.send("upd", ["state": "checked", "latest": pkg.0, "installed": have,
+                                  "newer": have.isEmpty || App.newer(pkg.0, than: have)])
+            }.resume()
+        }.resume()
+    }
+    func startDownload(name: String, sha: String, url: URL, efi: String?) {
+        guard pendingDownload == nil, !runningSetup else { return }
+        do { try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true) }
+        catch { send("dl", ["state": "error", "why": error.localizedDescription]); return }
+        let task = downloadSession.downloadTask(with: url)
+        pendingDownload = (task.taskIdentifier, DownloadPlan(name: name, sha: sha, efi: efi))
         send("dl", ["state": "start"])
+        task.resume()
+    }
+    func updateDriver(efi: String) {
+        guard let l = latest else { send("upd", ["state": "error", "why": "check for an update first"]); return }
+        startDownload(name: l.name, sha: l.sha, url: l.url, efi: efi)
+    }
+    func download() {
+        startDownload(name: Package.name, sha: Package.sha256, url: Package.url, efi: nil)
     }
     func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didWriteData b: Int64, totalBytesWritten w: Int64, totalBytesExpectedToWrite e: Int64) {
+        guard pendingDownload?.id == t.taskIdentifier else { return }
         send("dl", ["state": "progress", "done": w, "total": e])
     }
     func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didFinishDownloadingTo loc: URL) {
+        guard let pending = pendingDownload, pending.id == t.taskIdentifier else { return }
+        let plan = pending.plan
         let code = (t.response as? HTTPURLResponse)?.statusCode ?? 0
-        let dst = support.appendingPathComponent(Package.name)
+        let dst = support.appendingPathComponent(plan.name)
         guard code == 200 else { send("dl", ["state": "error", "why": "the server answered HTTP \(code)"]); return }
-        guard sha256(loc) == Package.sha256 else { send("dl", ["state": "error", "why": "the download does not match its SHA-256, so it was thrown away"]); return }
-        try? FileManager.default.removeItem(at: dst)
-        do { try FileManager.default.moveItem(at: loc, to: dst) } catch { send("dl", ["state": "error", "why": error.localizedDescription]); return }
+        guard sha256(loc) == plan.sha else { send("dl", ["state": "error", "why": "the download does not match its SHA-256, so it was thrown away"]); return }
+        do {
+            if FileManager.default.fileExists(atPath: dst.path) {
+                _ = try FileManager.default.replaceItemAt(dst, withItemAt: loc)
+            } else { try FileManager.default.moveItem(at: loc, to: dst) }
+        } catch { send("dl", ["state": "error", "why": error.localizedDescription]); return }
+        pendingDownload = nil
         send("dl", ["state": "done", "path": dst.path])
+        if let efi = plan.efi {
+            run(mode: "install", pkg: dst.path, efi: efi, extra: [], expectedSha: plan.sha)
+        }
     }
     func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError e: Error?) {
+        guard pendingDownload?.id == task.taskIdentifier else { return }
+        pendingDownload = nil
         if let e { send("dl", ["state": "error", "why": e.localizedDescription]) }
     }
 
     func usbWatch(_ on: Bool) {
+        usbGeneration += 1
         usbTimer?.invalidate(); usbTimer = nil
         if on {
             seenUsb = [:]
@@ -413,15 +586,19 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         }
     }
     func usbTick() {
+        let generation = usbGeneration
         DispatchQueue.global().async {
             let c = usbControllers()
-            for ctl in c {
-                let n = ctl["controller"] as! String
-                for p in ctl["ports"] as! [[String: Any]] where !((p["devices"] as? [String]) ?? []).isEmpty {
-                    self.seenUsb[n, default: []].insert(p["name"] as! String)
+            DispatchQueue.main.async {
+                guard self.usbGeneration == generation else { return }
+                for ctl in c {
+                    let n = usbControllerKey(ctl)
+                    for p in ctl["ports"] as! [[String: Any]] where !((p["devices"] as? [String]) ?? []).isEmpty {
+                        self.seenUsb[n, default: []].insert(p["name"] as! String)
+                    }
                 }
+                self.send("usb", ["controllers": c, "seen": self.seenUsb.mapValues { Array($0) }])
             }
-            self.send("usb", ["controllers": c, "seen": self.seenUsb.mapValues { Array($0) }])
         }
     }
     func usbWrite(_ sel: [String: [String: Int]], efi: String) {
@@ -435,62 +612,174 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         run(mode: "usbmap", pkg: "", efi: efi, extra: ["--usbmap", dir.deletingLastPathComponent().deletingLastPathComponent().path])
     }
 
-    // ⭐ "Send logs" (two clicks: the button, then Send). Collects 1401's own logs, the driver's state, a redacted crash
+    func optionalDiagnostics() {
+        guard let resources = Bundle.main.resourceURL else { return }
+        send("diagnosticsStatus", ["text": "Checking availability. No trace starts."])
+        DispatchQueue.global().async {
+            let receipt = OptionalDiagnostics.prerequisites(executable: resources.appendingPathComponent("nullmoth-diagnostics-preflight"), targetPID: getpid())
+            self.send("diagnosticsStatus", ["text": OptionalDiagnostics.guidance(receipt)])
+        }
+    }
+
+    func importDiagnosticReceipt() {
+        let panel = NSOpenPanel(); panel.title = "Choose a saved diagnostics receipt"
+        panel.allowsMultipleSelection = false; panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.json]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try DiagnosticReceipts.privateFile(url)
+            _ = try DiagnosticReceipts.validatedSummary(data)
+            try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+            try DiagnosticReceipts.stage(data, directory: support.appendingPathComponent("Diagnostics", isDirectory: true))
+            send("diagnosticReceipt", ["text": "Saved receipt accepted. Only its validated count/configuration summary can be sent, after the separate Send logs confirmation. Nothing has been uploaded."])
+        } catch {
+            send("diagnosticReceipt", ["text": "Receipt refused. Choose an unchanged supported JSON receipt saved with this session's upload permission, owned by this account, with private file permissions (0600). Other logs remain available."])
+        }
+    }
+
+    // "Send logs" (two clicks: the button, then Send). Collects 1401's own logs, the driver's state, a redacted crash
     // report when the driver crashed, and - after macOS asks for the password - OpenCore's boot logs and saved panics
     // from every OpenCore partition (sticks included). Every file is uploaded with its SHA-256, and the site refuses
     // any upload whose bytes differ from it.
     func sendLogs() {
         let a = NSAlert()
         a.messageText = "Send logs to NullMoth"
-        a.informativeText = "1401 is sending this Mac's NullMoth logs to nullmothsystems.com so the problem can be found and fixed: what 1401 did, the driver's state, crash reports that name the driver, and OpenCore's startup logs. Your name, your Mac's name, serial numbers and addresses are removed first. macOS asks for your password so 1401 can read the startup logs."
+        a.informativeText = "1401 is sending this Mac's NullMoth logs to nullmothsystems.com so the problem can be found and fixed: what 1401 did, the driver's state, driver crash reports, recent WindowServer, Firefox and Blender crash reports, update diagnostics, OpenCore's startup logs, and a numeric device/CPU relationship map. A separately imported diagnostics receipt is included only if that session allowed upload, and only as a validated count/configuration summary. The map records kernel-visible hardware, not verified driver support. Your name, your Mac's name, serial numbers and addresses are removed first. macOS asks for your password so 1401 can read the startup logs."
         a.addButton(withTitle: "Send"); a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { send("logsDone", ["ok": false, "why": "Not sent."]); return }
         DispatchQueue.global().async {
             let fm = FileManager.default
-            let dir = fm.temporaryDirectory.appendingPathComponent("1401-logs-\(Int(Date().timeIntervalSince1970))")
-            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let script = Bundle.main.resourceURL!.appendingPathComponent("nullmoth-setup.sh").path
+            let dir: URL
+            do {
+                dir = try SavedReports.session(in: logs.appendingPathComponent("Reports"))
+                _ = try SavedReports.create(Data("Log collection started. Files are retained locally after upload.\n".utf8), in: dir, name: "session.txt")
+            } catch {
+                DispatchQueue.main.async { self.send("logsDone", ["ok": false, "why": "Could not save a local report: \(error.localizedDescription)"]) }
+                return
+            }
+            let script = Bundle.main.resourceURL!.appendingPathComponent("nullmoth-log-capture.sh").path
             let q = { (x: String) in "'" + x.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-            let cmd = "/bin/bash \(q(script)) --collect-logs \(q(dir.path)) > \(q(dir.appendingPathComponent("collect.txt").path)) 2>&1"
+            let cmd = "/bin/bash \(q(script))"
             var err: NSDictionary?
-            NSAppleScript(source: "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges")?.executeAndReturnError(&err)
+            var collectionErrors: [String] = []
+            if let appleScript = NSAppleScript(source: "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges") {
+                let result = appleScript.executeAndReturnError(&err)
+                do { collectionErrors += try SavedReports.importCollection(result.stringValue ?? "", to: dir) }
+                catch { collectionErrors.append("System log collection was incomplete: \(error.localizedDescription)") }
+            } else { collectionErrors.append("System log collection could not be started.") }
+            if let error = err { collectionErrors.append(redact(error.description)) }
+            if !collectionErrors.isEmpty {
+                do { _ = try SavedReports.create(Data(collectionErrors.joined(separator: "\n").utf8), in: dir, name: "collection-errors.txt") }
+                catch { collectionErrors.append("The collector error summary could not be saved.") }
+            }
+            if let executable = Bundle.main.executableURL {
+                let map = HardwareMapWorker.run(executable: executable)
+                let target = dir.appendingPathComponent("hardware-map.json")
+                if let data = try? JSONSerialization.data(withJSONObject: map, options: [.prettyPrinted, .sortedKeys]) {
+                    try? data.write(to: target, options: .atomic)
+                    try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+                }
+            }
             var files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
+            let sessions = (try? fm.contentsOfDirectory(at: logs.appendingPathComponent("Reports"), includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            let retained = sessions.filter { $0 != dir }.flatMap { session in
+                ((try? fm.contentsOfDirectory(at: session, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
+                    .filter { $0.lastPathComponent.hasPrefix("setup-") || $0.lastPathComponent.hasPrefix("pending-") }
+            }
             let mine = ((try? fm.contentsOfDirectory(at: logs, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
                 .sorted { ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >
                           ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) }
-            files += mine.prefix(5)
+            let pendingFiles = retained.filter { $0.lastPathComponent.hasPrefix("pending-") }
+            files += (mine + retained.filter { !$0.lastPathComponent.hasPrefix("pending-") })
+                .filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true }
+                .sorted {
+                    let a = $0.lastPathComponent.hasPrefix("pending-")
+                    let b = $1.lastPathComponent.hasPrefix("pending-")
+                    if a != b { return a }
+                    return ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) <
+                           ((try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast)
+                }
+                .prefix(24)
+            for crash in userApplicationCrashes() {
+                let target = dir.appendingPathComponent("macos-" + crash.lastPathComponent)
+                if (try? fm.copyItem(at: crash, to: target)) != nil { files.append(target) }
+            }
             let crashes = driverCrashes(sinceInstallOnly: false)
             if !crashes.isEmpty {
                 let cr = dir.appendingPathComponent("crash-report.txt")
                 if writeReport(Array(crashes.prefix(3)), to: cr) { files.append(cr) }
             }
-            var ids: [String] = [], errs: [String] = []
-            for f in files.prefix(12) {
-                guard var data = try? Data(contentsOf: f), !data.isEmpty else { continue }
-                data.removeAll { $0 == 0 }   // the site refuses a text log with NUL bytes (OpenCore pads its log file)
-                let text = redact(String(decoding: data, as: UTF8.self))
-                let body = Data(text.utf8)
-                let sha = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
+            var ids: [String] = [], errs: [String] = collectionErrors, acknowledgements: [[String: String]] = []
+            let savedReceipt = support.appendingPathComponent("Diagnostics/diagnostic-receipt.json")
+            if fm.fileExists(atPath: savedReceipt.path) {
+                do {
+                    let data = try DiagnosticReceipts.privateFile(savedReceipt)
+                    let summary = try DiagnosticReceipts.sanitized(data, sendLogsConsent: true)
+                    let target = dir.appendingPathComponent("diagnostic-session.json")
+                    try summary.write(to: target, options: .atomic)
+                    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+                    files.append(target)
+                } catch { errs.append("The optional diagnostics receipt was refused; ordinary logs are retained.") }
+            }
+            if err != nil { errs.append("Some system logs could not be collected. See collect.txt for details.") }
+            // Directory enumeration is unordered: a stick with many boot logs could crowd out
+            // the GPU state, kernel log, or crash report. Always send those first.
+            let important = ["hardware-map.json", "driver-state.txt", "driver-kernel-log.txt", "driver-plugin-log.txt", "crash-report.txt", "diagnostic-session.json", "collect.txt", "driver-update-log.txt"]
+            files.sort {
+                let a = supportCrashRank($0.lastPathComponent) ?? (important.firstIndex(of: $0.lastPathComponent) ?? important.count)
+                let b = supportCrashRank($1.lastPathComponent) ?? (important.firstIndex(of: $1.lastPathComponent) ?? important.count)
+                let pendingA = $0.lastPathComponent.hasPrefix("pending-")
+                let pendingB = $1.lastPathComponent.hasPrefix("pending-")
+                if pendingA != pendingB { return pendingA }
+                return a == b ? $0.lastPathComponent < $1.lastPathComponent : a < b
+            }
+            // One random value per send, shared by every file of it, so the site can group one run's logs. It names the
+            // run, not the Mac: a new one each time.
+            let batch = newUploadBatch()
+            let prepared: ReportQueue.Prepared
+            do {
+                prepared = try ReportQueue.prepare(files: files, pendingFiles: pendingFiles, in: dir) { data in
+                    var bytes = data; bytes.removeAll { $0 == 0 }
+                    return Data(redact(String(decoding: bytes, as: UTF8.self)).utf8)
+                }
+            } catch {
+                DispatchQueue.main.async { self.send("logsDone", ["ok": false, "why": "Could not save the report queue: \(error.localizedDescription)", "localPath": dir.path]) }
+                return
+            }
+            errs += prepared.warnings
+            let selected = ReportQueue.select(prepared.entries)
+            if prepared.entries.count > selected.count { errs.append("More reports are saved for the next Send logs attempt.") }
+            for entry in selected {
+                let body = entry.bytes, sha = entry.sha, name = entry.name
                 var req = URLRequest(url: URL(string: "https://nullmothsystems.com/api/upload")!, timeoutInterval: 60)
                 req.httpMethod = "POST"; req.httpBody = body
                 req.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-                let name = f.lastPathComponent.hasSuffix(".txt") || f.lastPathComponent.hasSuffix(".log") ? f.lastPathComponent : f.lastPathComponent + ".txt"
                 req.setValue(name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "log.txt", forHTTPHeaderField: "X-File-Name")
-                let meta = try! JSONSerialization.data(withJSONObject: ["consent": true, "notes": "1401 Mac \(Package.version) logs (sent from the app)", "batch": "1401-mac"])
+                let meta = try! JSONSerialization.data(withJSONObject: ["consent": true, "notes": "1401 Mac \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?") (driver \(Package.version)) logs (sent from the app)", "batch": batch])
                 req.setValue(meta.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: ""), forHTTPHeaderField: "X-Meta")
                 req.setValue(sha, forHTTPHeaderField: "X-Content-SHA256")
                 let done = DispatchSemaphore(value: 0)
-                URLSession.shared.dataTask(with: req) { d, _, e in
-                    if let d = d, let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-                        if let id = j["id"] as? String, (j["sha256"] as? String ?? sha) == sha { ids.append(id) }
-                        else { errs.append("\(name): \(j["error"] as? String ?? "refused")") }
-                    } else { errs.append("\(name): \(e?.localizedDescription ?? "no answer")") }
+                let result = ReportUploadResult()
+                let task = URLSession.shared.dataTask(with: req) { data, response, error in
+                    result.finish(data: data, response: response, error: error, sha256: sha)
                     done.signal()
-                }.resume()
-                _ = done.wait(timeout: .now() + 90)
+                }
+                task.resume()
+                let timedOut = done.wait(timeout: .now() + 90) == .timedOut
+                if timedOut { task.cancel() }
+                let outcome = result.take(timedOut: timedOut)
+                if let id = outcome.0 {
+                    ids.append(id); acknowledgements.append(["name": name, "sha256": sha, "id": id])
+                    do { try ReportQueue.confirm(entry, id: id, in: dir) }
+                    catch { errs.append("\(name): confirmed, but its local retry marker could not be updated.") }
+                }
+                if let error = outcome.1 { errs.append("\(name): \(error)") }
             }
-            try? fm.removeItem(at: dir)
-            DispatchQueue.main.async { self.send("logsDone", ["ok": !ids.isEmpty, "ids": ids, "errors": errs]) }
+            do {
+                let receipt = try JSONSerialization.data(withJSONObject: ["batch": batch, "confirmed": acknowledgements, "errors": errs], options: [.prettyPrinted, .sortedKeys])
+                _ = try SavedReports.create(receipt, in: dir, name: "upload-receipt.json")
+            } catch { errs.append("The upload receipt could not be saved; collected files remain locally.") }
+            DispatchQueue.main.async { self.send("logsDone", ["ok": !ids.isEmpty, "ids": ids, "errors": errs, "localPath": dir.path]) }
         }
     }
 
@@ -505,41 +794,86 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         } else { send("crashDone", ["ok": false, "why": "Could not write the report to the Desktop."]) }
     }
 
-    func run(mode: String, pkg: String, efi: String, extra: [String]) {
-        try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
-        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "")
-        let log = logs.appendingPathComponent("setup-\(mode)-\(stamp).log")
-        FileManager.default.createFile(atPath: log.path, contents: nil)
+    func run(mode: String, pkg: String, efi: String, extra: [String], expectedSha: String? = nil) {
+        guard ["dry", "install", "remove", "usbmap", "verbose"].contains(mode),
+              !runningSetup, pendingDownload == nil else { return }
+        runningSetup = true
+        let log: URL
+        do {
+            let directory = try SavedReports.session(in: logs.appendingPathComponent("Reports"))
+            log = try SavedReports.create(Data("Setup \(mode) started.\n".utf8), in: directory, name: "setup-\(mode).log")
+        } catch {
+            runningSetup = false
+            send("run", ["state": "end", "mode": mode, "ok": false, "why": "Could not save a local report: \(error.localizedDescription)"])
+            return
+        }
         let res = Bundle.main.resourceURL!
         var args: [String]
         switch mode {
         case "remove": args = ["--remove"]
-        case "usbmap", "verbose", "update": args = extra
+        case "usbmap", "verbose": args = extra
         default:
-            args = ["--pkg", pkg, "--sha", Package.sha256, "--tool", res.appendingPathComponent("NullMothSafe.efi").path,
+            args = ["--pkg", pkg, "--sha", expectedSha ?? Package.sha256, "--tool", res.appendingPathComponent("NullMothSafe.efi").path,
                     "--app", Bundle.main.executablePath ?? ""]
             if mode == "dry" { args.append("--dry") }
+            // per-system rules: this machine's profile picks the rules (nullmoth-rules.json); their knobs go to the setup script
+            let prof = App.machineProfile(pciDisplays())
+            let sel = Profile.select(App.rules(), prof)
+            for (k, v) in sel.conf.sorted(by: { $0.key < $1.key }) { args += ["--knob", "\(k)=\(v)"] }
+            var record = prof; record["rules"] = sel.ids
+            let pf = FileManager.default.temporaryDirectory.appendingPathComponent("nullmoth-profile-\(UUID().uuidString).json")
+            if let d = try? JSONSerialization.data(withJSONObject: record, options: [.prettyPrinted, .sortedKeys]), (try? d.write(to: pf)) != nil {
+                args += ["--profile", pf.path]
+            }
             args += extra
         }
-        if mode != "remove", efi != "auto", !efi.isEmpty { args += ["--efi", efi] }
+        if efi != "auto", !efi.isEmpty { args += ["--efi", efi] }
         let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let cmd = "/bin/bash \(q(res.appendingPathComponent("nullmoth-setup.sh").path)) \(args.map(q).joined(separator: " ")) >> \(q(log.path)) 2>&1"
+        let cmd = "/bin/bash \(q(res.appendingPathComponent("nullmoth-operation-capture.sh").path)) \(args.map(q).joined(separator: " "))"
         let asrc = "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
         send("run", ["state": "start", "mode": mode, "log": log.path])
         DispatchQueue.global().async {
-            let done = DispatchSemaphore(value: 0)
-            var sent = 0
-            DispatchQueue.global().async {
-                while done.wait(timeout: .now() + 0.3) == .timedOut { sent = self.flush(log, from: sent) }
-            }
             var err: NSDictionary?
-            NSAppleScript(source: asrc)?.executeAndReturnError(&err)
-            done.signal()
-            Thread.sleep(forTimeInterval: 0.4)
-            sent = self.flush(log, from: sent)
-            if let err, (err[NSAppleScript.errorNumber] as? Int) == -128 { self.send("run", ["state": "cancelled", "mode": mode]); return }
+            var captureFailed = false
+            if let script = NSAppleScript(source: asrc) {
+                let result = script.executeAndReturnError(&err)
+                do {
+                    let directory = log.deletingLastPathComponent()
+                    let warnings = try SavedReports.importCollection(result.stringValue ?? "", to: directory)
+                    for name in ["setup-output.txt", "setup-output-head.txt", "setup-output-tail.txt"] {
+                        let file = directory.appendingPathComponent(name)
+                        if FileManager.default.fileExists(atPath: file.path) {
+                            try SavedReports.append(Data(contentsOf: file), to: log)
+                        }
+                    }
+                    for warning in warnings { try SavedReports.append(Data(("\n" + warning + "\n").utf8), to: log) }
+                    captureFailed = !warnings.isEmpty
+                } catch {
+                    captureFailed = true
+                    let message = "Could not retain setup output: \(error.localizedDescription)"
+                    do { _ = try SavedReports.create(Data(message.utf8), in: log.deletingLastPathComponent(), name: "setup-capture-error.txt") }
+                    catch { self.send("lines", ["The capture error could not be saved: \(error.localizedDescription)"]) }
+                    self.send("lines", [message])
+                }
+            } else {
+                captureFailed = true
+                self.send("lines", ["Could not start the setup command."])
+            }
+            _ = self.flush(log, from: 0)
+            let cancelled = (err?[NSAppleScript.errorNumber] as? Int) == -128
+            if let error = err {
+                let message = redact(error.description)
+                do { _ = try SavedReports.create(Data(message.utf8), in: log.deletingLastPathComponent(), name: "setup-launch-error.txt") }
+                catch { DispatchQueue.main.async { self.send("lines", ["Could not save the setup error: \(error.localizedDescription)"]) } }
+            }
             let text = (try? String(contentsOf: log, encoding: .utf8)) ?? ""
-            self.send("run", ["state": "end", "mode": mode, "ok": text.contains("RESULT ok"), "log": log.path])
+            let result = text.split(separator: "\n").last(where: { $0.hasPrefix("RESULT ") })
+            let succeeded = err == nil && !captureFailed && result == "RESULT ok"
+            DispatchQueue.main.async {
+                self.runningSetup = false
+                if cancelled { self.send("run", ["state": "cancelled", "mode": mode]) }
+                else { self.send("run", ["state": "end", "mode": mode, "ok": succeeded, "log": log.path]) }
+            }
         }
     }
     func flush(_ log: URL, from: Int) -> Int {
@@ -554,6 +888,14 @@ let argv = CommandLine.arguments
 func table() -> [String: Any] {
     guard let d = try? Data(contentsOf: Bundle.main.resourceURL!.appendingPathComponent("nvidia_gsp_ids.json")) else { return [:] }
     return (try? JSONSerialization.jsonObject(with: d) as? [String: Any]) ?? [:]
+}
+if argv == [argv[0], "--hardware-map"] {
+    var map = HardwareMap.collect()
+    var bytesWritten = 0
+    guard HardwareMapWorker.emitCheckpoint(map, phase: "baseline", bytesWritten: &bytesWritten) else { exit(75) }
+    map["peripheral_facts"] = NativePeripheralFacts.collect()
+    guard HardwareMapWorker.emitCheckpoint(map, phase: "final", bytesWritten: &bytesWritten) else { exit(75) }
+    exit(0)
 }
 if argv.contains("--scan") { print(json(App.scanMac(table()))); exit(0) }
 if argv.contains("--usb") { print(json(usbControllers())); exit(0) }

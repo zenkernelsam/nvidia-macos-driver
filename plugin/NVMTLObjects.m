@@ -157,16 +157,24 @@ static inline void nvmtl_resref(id o, int d) {
 @implementation NVMTLResSet
 - (instancetype)init { if ((self = [super init])) _s = [NSMutableSet new]; return self; }
 - (instancetype)initWithCapacity:(NSUInteger)n { if ((self = [super init])) _s = [[NSMutableSet alloc] initWithCapacity:n]; return self; }
-- (NSUInteger)count { return _s.count; }
-- (id)member:(id)o { return [_s member:o]; }
-- (NSEnumerator *)objectEnumerator { return [_s objectEnumerator]; }
+// 10-07 (user crash report NM-W8WHES8G, RTX 5060 Ti): Hackintool died in -[__NSSetM member:] under -addObject:, called
+// from setFragmentTexture on CoreAnimation's async-render workqueue thread. NSMutableSet is not thread-safe and nothing
+// here serialised it, so every operation now holds _lk. Enumeration hands out a snapshot, never the live set.
+- (NSUInteger)count { os_unfair_lock_lock(&_lk); NSUInteger n = _s.count; os_unfair_lock_unlock(&_lk); return n; }
+- (id)member:(id)o { os_unfair_lock_lock(&_lk); id m = [_s member:o]; os_unfair_lock_unlock(&_lk); return m; }
+- (NSArray *)nvmtlSnapshot { os_unfair_lock_lock(&_lk); NSArray *a = _s.allObjects; os_unfair_lock_unlock(&_lk); return a; }
+- (NSEnumerator *)objectEnumerator { return [[self nvmtlSnapshot] objectEnumerator]; }
+// for-in runs only over a command buffer part's own copy (one thread), never over a set still being encoded into
 - (NSUInteger)countByEnumeratingWithState:(NSFastEnumerationState *)st objects:(id __unsafe_unretained [])b count:(NSUInteger)n {
     return [_s countByEnumeratingWithState:st objects:b count:n]; }
-- (void)addObject:(id)o { if (!o || [_s member:o]) return; [_s addObject:o]; nvmtl_resref(o, 1); }
-- (void)removeObject:(id)o { if (!o || ![_s member:o]) return; nvmtl_resref(o, -1); [_s removeObject:o]; }
-- (void)removeAllObjects { for (id o in _s) nvmtl_resref(o, -1); [_s removeAllObjects]; }
+- (void)addObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); BOOL had = [_s member:o] != nil; if (!had) [_s addObject:o];
+    os_unfair_lock_unlock(&_lk); if (!had) nvmtl_resref(o, 1); }
+- (void)removeObject:(id)o { if (!o) return; os_unfair_lock_lock(&_lk); BOOL had = [_s member:o] != nil; if (had) [_s removeObject:o];
+    os_unfair_lock_unlock(&_lk); if (had) nvmtl_resref(o, -1); }
+- (void)removeAllObjects { os_unfair_lock_lock(&_lk); NSArray *a = _s.allObjects; [_s removeAllObjects]; os_unfair_lock_unlock(&_lk);
+    for (id o in a) nvmtl_resref(o, -1); }
 - (id)copyWithZone:(NSZone *)z { atomic_fetch_add(&gRes2Tick, 1);
-    NVMTLResSet *c = [[NVMTLResSet alloc] initWithCapacity:_s.count]; for (id o in _s) [c addObject:o]; return c; }
+    NSArray *a = [self nvmtlSnapshot]; NVMTLResSet *c = [[NVMTLResSet alloc] initWithCapacity:a.count]; for (id o in a) [c addObject:o]; return c; }
 - (id)mutableCopyWithZone:(NSZone *)z { return [self copyWithZone:z]; }
 - (void)dealloc { for (id o in _s) nvmtl_resref(o, -1); }
 @end
@@ -4552,7 +4560,17 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)popDebugGroup {}
 - (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
 - (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
-- (BOOL)commitAndWaitUntilSubmitted { [self commit]; [self waitUntilScheduled]; return self.status != MTLCommandBufferStatusError; }
+// The display-pipe swap follows this call immediately in WindowServer. NVAccel
+// cannot order that swap after an NVK fence, so wait for the pixels to finish
+// before allowing the surface to become scanout. Other applications keep the
+// normal submission-only contract.
+- (BOOL)commitAndWaitUntilSubmitted {
+    static int ws = -1;
+    if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    [self commit];
+    if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    return self.status != MTLCommandBufferStatusError;
+}
 - (void)commit { [self nvmtlSubmitWithEvents]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
