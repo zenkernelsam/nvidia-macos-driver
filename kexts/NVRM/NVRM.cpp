@@ -513,7 +513,22 @@ void NVRM::autoGo(void *p0, wait_result_t)
 {
     NVRM *s = (NVRM *)p0;
     char nb[8] = { 0 };
-    IOSleep(s->fAutoGoSettleMs);
+    // A card whose BAR1 could not be placed outside the boot screen (Resizable BAR off: 256 MB) waits 100 s here with
+    // the registry held busy, so the verbose screen showed only "busy timeout ... 'NVRM'" for two minutes and users
+    // reset machines that were still starting (7 reports, RTX 2070 SUPER/3050/3060/3070, GTX 1660 SUPER, Quadro T2000,
+    // 2026-10-07/08). Say what is happening and how to avoid it, every 15 s, on the same screen.
+    if (s->fAutoGoSettleMs > 5000) {
+        LOG("starting the NVIDIA card: waiting %u s before it takes over the screen, because its memory window (BAR1) "
+            "is too small to move off the boot screen. This is not a freeze. To start in about a second instead, enable "
+            "\"Above 4G Decoding\" and \"Resizable BAR\" in the BIOS.", s->fAutoGoSettleMs / 1000);
+        for (uint32_t left = s->fAutoGoSettleMs; left > 0;) {
+            const uint32_t step = left > 15000 ? 15000 : left;
+            IOSleep(step); left -= step;
+            if (left) LOG("starting the NVIDIA card: %u s left (not a freeze)", left / 1000);
+        }
+    } else {
+        IOSleep(s->fAutoGoSettleMs);
+    }
     s->measureBootRaster();
     { thread_t hw = THREAD_NULL; s->retain();
       if (kernel_thread_start(&NVRM::headWatch, s, &hw) == KERN_SUCCESS) thread_deallocate(hw); else s->release(); }
@@ -702,7 +717,7 @@ bool NVRM::placeLargeBar1()
     // 10-07: with "Resizable BAR" off in the BIOS (or a card the firmware leaves at 256 MB) the firmware places a small
     // BAR1 over the boot screen and the driver had nothing to move. The card itself can resize: take the largest size it
     // supports between 4 GB and 8 GB, written below once the destination is proven free.
-    // 10-07 (NM-G68Y845E RTX 3060, NM-4XAED8CN RTX 5080): both cards resized to 16 GB stopped during bring-up (GSP boot,
+    // 10-07 (RTX 3060, RTX 5080): both cards resized to 16 GB stopped during bring-up (GSP boot,
     // NVAccel start), and the same RTX 3060 runs the desktop at 8 GB. 8 GB is the size proven on hardware (RTX 5060, 3060).
     UInt64 newSize = 0;
     if (bar1Size < (4ULL << 30)) {
@@ -744,7 +759,7 @@ bool NVRM::placeLargeBar1()
     IOService *pp = fPCI->getProvider();
     IOPCIDevice *rp = pp ? OSDynamicCast(IOPCIDevice, pp->getProvider()) : NULL;
     if (!rp || (rp->configRead8(0x0e) & 0x7f) != 1) { LOG("bar1: parent root port not found — not placing"); return false; }
-    // 10-07 (NM-Y6ME6FJ2, RTX 3070 eGPU on a MacBookPro16,1): only the parent bridge's window is reprogrammed below. Behind
+    // 10-07 (RTX 3070 eGPU on a MacBookPro16,1): only the parent bridge's window is reprogrammed below. Behind
     // Thunderbolt or a PCIe switch the parent is a downstream port, and the bridges above it keep their old windows, so the
     // moved BAR1/BAR3 were unreachable and RM failed kbusVerifyBar2 (NV_ERR_MEMORY_ERROR). Move only under a Root Port.
     {

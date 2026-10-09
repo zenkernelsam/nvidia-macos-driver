@@ -121,7 +121,7 @@ if [ -n "$COLLECT" ]; then
     echo; echo "== NVRM"; ioreg -r -n NVRM -d 1 -l 2>/dev/null | grep -E '"nvrm-'
     echo; echo "== system profile and per-system rules"; cat "$ST/system-profile.json" 2>/dev/null || echo "(none recorded)"
     sed -n '/^# --- 1401 per-system rules ---$/,/^# --- end 1401 per-system rules ---$/p' /Library/GPUBundles/nvmtl/nvrm610.conf 2>/dev/null
-    # 10-07 (NM-34FKN6ZK): a second user's install failed and nothing sent named the card. The GPU model and PCI ID
+    # 10-07: a second user's install failed and nothing sent named the card. The GPU model and PCI ID
     # are what decide which code path the driver takes (Turing/Ampere/Ada/Blackwell).
     echo; echo "== graphics"; system_profiler SPDisplaysDataType 2>/dev/null | grep -E "Chipset Model|Type:|Bus:|VRAM|Vendor|Device ID|Revision ID|Metal|Resolution|Display Type|Online"
     echo; echo "== NVIDIA PCI devices"; ioreg -r -c IOPCIDevice -d 1 -l 2>/dev/null | awk '
@@ -157,6 +157,32 @@ if [ -n "$COLLECT" ]; then
     [ -f "$f" ] || continue
     { echo; echo "== plugin file log"; tail -c 262144 "$f"; } >> "$COLLECT/driver-plugin-log.txt"
   done
+  # The rolling logs above keep only the newest lines, so the boot where WindowServer actually crashed was usually
+  # gone by the time the user sent logs: eight crash reports in one day named the abort ("Failed to create
+  # MetalDevice") but none carried the plugin's reason. For each recent WindowServer crash, keep the driver's own
+  # lines from two minutes before it to just after it. The report's timestamp is local time, as log show expects.
+  {
+    for ips in $(ls -t /Library/Logs/DiagnosticReports/WindowServer*.ips /Library/Logs/DiagnosticReports/Retired/WindowServer*.ips 2>/dev/null | head -n 3); do
+      stamp=$(head -n 1 "$ips" 2>/dev/null | sed -n 's/.*"timestamp" *: *"\([0-9-]* [0-9:]*\)[^"]*".*/\1/p')
+      echo; echo "== WindowServer crash ${ips##*/} at ${stamp:-unknown time}"
+      [ -n "$stamp" ] || { echo "(no timestamp in the report)"; continue; }
+      at=$(date -j -f "%Y-%m-%d %H:%M:%S" "$stamp" "+%s" 2>/dev/null) || { echo "(timestamp not understood: $stamp)"; continue; }
+      from=$(date -j -r $((at - 120)) "+%Y-%m-%d %H:%M:%S"); to=$(date -j -r $((at + 5)) "+%Y-%m-%d %H:%M:%S")
+      # log show runs past --end (measured: an 11:26:47 end returned lines to 11:28:20), so lines are cut at "to" here.
+      # Separate budgets: on a busy GPU the kernel lines alone filled a shared 1500-line tail and pushed out the
+      # plugin's and WindowServer's own reason (measured: 1482 of 1500 lines were kernel lines).
+      echo "-- plugin and WindowServer errors"
+      log show --start "$from" --end "$to" --style compact --predicate '(process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason" OR eventMessage CONTAINS[c] "MetalDevice")) OR (process == "WindowServer" AND (messageType == error OR messageType == fault))' 2>&1 \
+        | awk -v to="$to" '!/^20[0-9][0-9]-/ || substr($0, 1, 19) <= to' \
+        | tail -n 700
+      echo "log show exit: ${PIPESTATUS[0]}"
+      echo "-- kernel driver lines"
+      log show --start "$from" --end "$to" --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
+        | awk -v to="$to" '!/^20[0-9][0-9]-/ || substr($0, 1, 19) <= to' \
+        | tail -n 800
+      echo "log show exit: ${PIPESTATUS[0]}"
+    done
+  } > "$COLLECT/driver-crash-window.txt" 2>&1
   n=0; collection_errors=0
   collect_recent_logs macos 3 /Library/Logs/DiagnosticReports/*.panic
   # WindowServer can fail outside a driver frame. Include the complete recent reports
@@ -196,7 +222,10 @@ if [ $REMOVE = 1 ]; then
   [ -n "$C" ] || stop "the install record has no OpenCore partition; select the original config - nothing changed"
   if [ -n "$C" ]; then
     [ -f "$C" ] && plutil -lint "$C" >/dev/null || stop "the OpenCore config is missing or invalid - nothing changed"
-    [ -f "$MP/${CONFIG_BACKUP_REL:-}" ] || stop "the recorded OpenCore backup is missing on this partition - nothing changed"
+    # The backup is used only when the config is unchanged since the install; otherwise the driver's settings are taken
+    # out of the current config in place. A missing backup stopped removal outright (user reports 10-08), although the
+    # in-place path below needs no backup at all - so it is a note, and that path runs.
+    [ -f "$MP/${CONFIG_BACKUP_REL:-}" ] || note "the recorded OpenCore backup is not on this partition; the driver's settings are removed from the current config instead"
   fi
   if [ -n "$C" ]; then
     step "Checking the OpenCore removal settings"
@@ -300,7 +329,7 @@ else
     fi
     n=$(echo $found | wc -w | tr -d ' ')
     if [ "$n" = 0 ]; then
-      # 10-07 (NM-HNQ1JK7A, an iMac20,1): the stop said only "no OpenCore config" - not whether the Mac runs Clover or
+      # 10-07 (an iMac20,1): the stop said only "no OpenCore config" - not whether the Mac runs Clover or
       # whether a config for ANOTHER model was there. Say what each partition holds, so the user (and the report) can tell.
       clover=""; for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
         mount_efi "$d" || { echo "NOTE $d: could not be mounted"; continue; }; mp=$MOUNT_POINT
@@ -316,6 +345,8 @@ else
     fi
     # A shared SMBIOS model or the macOS disk does not identify the booted EFI.
     # Retain candidate discovery, but require explicit selection without boot-path proof.
+    # File modification time does not identify the firmware startup partition: copies and clocks can match.
+    # Require the actual boot-path/GPT identity or an explicit verified selection before changing OpenCore.
     if [ "$BOOT_BOUND" != 1 ]; then
       for d in $found; do echo "NOTE candidate $d"; done
       stop "OpenCore's startup partition could not be confirmed - select the partition this Mac started from"
@@ -430,7 +461,7 @@ fi
 
 if [ -n "$USBMAP" ]; then
   step "Installing the USB map"
-  # 10-07 (NM-HZTKJHPZ): 1401 Mac 1.0.1 passed the .kext itself, so "$USBMAP/UTBMap.kext" never existed and every map
+  # 10-07: 1401 Mac 1.0.1 passed the .kext itself, so "$USBMAP/UTBMap.kext" never existed and every map
   # stopped as "not valid". Take the folder holding the kext or the kext itself.
   case "$USBMAP" in */UTBMap.kext|*/UTBMap.kext/) K="${USBMAP%/}";; *) K="$USBMAP/UTBMap.kext";; esac
   [ -f "$K/Contents/Info.plist" ] || stop "the USB map the app wrote is missing ($K)"

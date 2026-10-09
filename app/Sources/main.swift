@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "1.0.11"
-    static let name = "nullmoth-nvidia-1.0.11.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.0.17/nullmoth-nvidia-1.0.11.tar.gz")!
-    static let sha256 = "75869a4c74e5b1ffd27f7193dd0f5b86c6033903dd52d4ba1d268990dc003ff3"
+    static let version = "1.1.0"
+    static let name = "nullmoth-nvidia-1.1.0.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.1.0/nullmoth-nvidia-1.1.0.tar.gz")!
+    static let sha256 = "22478d83ed4d2b95711c2f001b40245e3198b6fb9716078c192e6ff18955d587"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -608,7 +608,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         guard let d = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0),
               (try? d.write(to: dir.appendingPathComponent("Info.plist"))) != nil else { send("usbErr", "could not write the map"); return }
-        // the script wants the folder that HOLDS UTBMap.kext (10-07, NM-HZTKJHPZ: passing the .kext itself failed every map)
+        // the script wants the folder that HOLDS UTBMap.kext (10-07: passing the .kext itself failed every map)
         run(mode: "usbmap", pkg: "", efi: efi, extra: ["--usbmap", dir.deletingLastPathComponent().deletingLastPathComponent().path])
     }
 
@@ -662,9 +662,21 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             let cmd = "/bin/bash \(q(script))"
             var err: NSDictionary?
             var collectionErrors: [String] = []
-            if let appleScript = NSAppleScript(source: "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges") {
-                let result = appleScript.executeAndReturnError(&err)
-                do { collectionErrors += try SavedReports.importCollection(result.stringValue ?? "", to: dir) }
+            // NSAppleScript is not thread-safe and its administrator password panel needs the main run loop. Run from this
+            // background queue it could hang or show a panel no one saw, and the window stayed on "Collecting and
+            // sending..." for an hour (user reports 10-08). The script runs on the main thread; the rest stays here.
+            var output: String? = nil, started = false
+            DispatchQueue.main.sync {
+                self.send("logsStatus", ["text": "Waiting for your Mac password (a macOS window asks for it)..."])
+                NSApp.activate(ignoringOtherApps: true)
+                if let appleScript = NSAppleScript(source: "do shell script \"\(cmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges") {
+                    started = true
+                    output = appleScript.executeAndReturnError(&err).stringValue
+                }
+                self.send("logsStatus", ["text": "Collecting and sending..."])
+            }
+            if started {
+                do { collectionErrors += try SavedReports.importCollection(output ?? "", to: dir) }
                 catch { collectionErrors.append("System log collection was incomplete: \(error.localizedDescription)") }
             } else { collectionErrors.append("System log collection could not be started.") }
             if let error = err { collectionErrors.append(redact(error.description)) }
