@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include "nvmtl_sample_positions.h"
+#include "nvmtl_log_failure.h"
 #include <sys/sysctl.h>
 #ifndef NVMTL_RELEASE
 #define NVMTL_RELEASE 0
@@ -76,6 +77,10 @@ const char *nvmtl_log_path(void) {
 #if NVMTL_RELEASE
     return "/private/tmp/nvmtl-off.log";
 #endif
+    // A diagnostic probe needs its own file even when the system log is writable.
+    // Otherwise the per-run fault watcher reads an empty file and misses GPU faults.
+    const char *requested = getenv("NVMTL_LOG_PATH");
+    if (requested && *requested) return requested;
     static char path[1024]; static int decided;
     if (!decided) {
         decided = 1;
@@ -92,7 +97,7 @@ void nvlog(const char *fmt, ...) {
     if (rep) snprintf(t, sizeof t, "%s   [logged %llu times now]", b, (unsigned long long)rep);
     else     snprintf(t, sizeof t, "%s", b);
 #if NVMTL_RELEASE
-    if (strstr(t, "FAIL") || strstr(t, "REFUS") || strstr(t, "fault")) syslog(LOG_ERR, "NullMoth: %s", t);
+    if (nvmtl_log_failure(t)) syslog(LOG_ERR, "NullMoth: %s", t);
 #else
     syslog(LOG_NOTICE, "NVMTL: %s", t);
     FILE *f = fopen(nvmtl_log_path(), "a"); if (f) { fprintf(f, "pid %d NVMTL: %s\n", getpid(), t); fclose(f); }
@@ -280,7 +285,7 @@ static bool nvmtl_process_is_allowed(void)
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
     FILE *f = fopen("/Library/GPUBundles/nvmtl-allow.txt", "r");
     if (!f) f = fopen("/Library/Extensions/nvmtl-allow.txt", "r");
-    if (!f) { nvlog("  no allow-list readable from this process: no device for %s", me); return false; }
+    if (!f) { nvlog("  no allow-list readable from this process: no device for %s (cannot read nvmtl-allow.txt)", me); return false; }
     char line[256]; bool ok = false;
     while (fgets(line, sizeof line, f)) {
         char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
