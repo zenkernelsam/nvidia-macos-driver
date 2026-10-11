@@ -31,8 +31,11 @@ static inline int nvmtl_rel_devpath(const char *p) {
 }
 static inline int nvmtl_rel_access(const char *p, int m) { return nvmtl_rel_devpath(p) ? -1 : access(p, m); }
 static inline FILE *nvmtl_rel_fopen(const char *p, const char *m) { return nvmtl_rel_devpath(p) ? NULL : fopen(p, m); }
-#define access nvmtl_rel_access
-#define fopen nvmtl_rel_fopen
+// Function-like on purpose: an object-like `#define access` also renamed every Objective-C `-access` method in this
+// one-TU plugin, so release builds answered -[MTLBinding access] with nothing (selector nvmtl_rel_access in the
+// shipped binary). Apple's OpenCL then read every image as read-only and refused write-only images (-38).
+#define access(p, m) nvmtl_rel_access(p, m)
+#define fopen(p, m) nvmtl_rel_fopen(p, m)
 #endif
 int nvmtl_vk_init(void);
 const char *nvmtl_vk_device_name(void);
@@ -171,6 +174,15 @@ static bool nvmtl_accel_armed(void)
 }
 #include <dlfcn.h>
 #include <libgen.h>
+// The video libraries tile and untile frames in the Blackwell (GB20x) layout. Earlier GPUs' NVDEC/NVENC use the classic
+// one: on an RTX 3070 Laptop (issue #65, measured against Apple's software codecs) H.264 decode showed shifted macroblock
+// rows and a green stripe, and both encoders produced torn pictures. The decoder's only difference is its untiling mode
+// (1 = Blackwell, 0 = classic), so earlier GPUs load libnvdec_h264_t2d.dylib, the same library with mode 0 (51 dB on
+// GA104). The encoders are not registered on them, so apps use Apple's encoder until they are fixed for those GPUs.
+static bool nvmtl_video_is_blackwell(void)
+{
+    return strstr(nvmtl_vk_device_name(), "NVK GB") != NULL;
+}
 static void nvmtl_nvdec_register(void)
 {
     static dispatch_once_t once;
@@ -185,7 +197,7 @@ static void nvmtl_nvdec_register(void)
         if (!dladdr((const void *)nvmtl_nvdec_register, &di) || !di.dli_fname) { nvlog("nvdec: dladdr failed - not registering"); return; }
         char dir[1024], path[1200];
         strlcpy(dir, di.dli_fname, sizeof dir);
-        snprintf(path, sizeof path, "%s/libnvdec_h264.dylib", dirname(dir));
+        snprintf(path, sizeof path, "%s/%s", dirname(dir), nvmtl_video_is_blackwell() ? "libnvdec_h264.dylib" : "libnvdec_h264_t2d.dylib");
         void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
         if (!h) { nvlog("nvdec: dlopen %s FAILED: %s", path, dlerror()); return; }
         void *fac = dlsym(h, "NVDecH264_CreateInstance");
@@ -203,6 +215,7 @@ static void nvmtl_nvenc_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC")) { nvlog("nvenc: NVMTL_NO_NVENC set - not registering in %s", me); return; }
+        if (!nvmtl_video_is_blackwell()) { nvlog("nvenc: %s is not Blackwell - H.264 encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -256,6 +269,7 @@ static void nvmtl_nvenc_hevc_register(void)
     dispatch_once(&once, ^{
         const char *me = getprogname();
         if (getenv("NVMTL_NO_NVENC_HEVC")) { nvlog("nvenc: NVMTL_NO_NVENC_HEVC set - not registering HEVC in %s", me); return; }
+        if (!nvmtl_video_is_blackwell()) { nvlog("nvenc: %s is not Blackwell - HEVC encode stays on Apple's encoder", nvmtl_vk_device_name()); return; }
         if (!strcmp(me, "WindowServer")) return;
         typedef int32_t (*RegFn)(uint32_t, CFDictionaryRef, void *);
         RegFn reg = (RegFn)dlsym(RTLD_DEFAULT, "VTRegisterVideoEncoderWithInfo");
@@ -281,6 +295,12 @@ static bool nvmtl_process_is_allowed(void)
 {
     const char *me = getprogname();
     if (!me) return false;
+    // A headless NVIDIA GPU (the display is on the Intel or AMD GPU) is a Metal device for apps only: WindowServer stays
+    // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
+    // WindowServer before its "!WindowServer" line is reached.
+    { int hv = 0; size_t hn = sizeof hv;
+      if (!strcmp(me, "WindowServer") && sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv) {
+          nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
     FILE *f = fopen("/Library/GPUBundles/nvmtl-allow.txt", "r");

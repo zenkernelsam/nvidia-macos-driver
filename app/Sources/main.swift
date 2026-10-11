@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "1.6.0"
-    static let name = "nullmoth-nvidia-1.6.0.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.6.0/nullmoth-nvidia-1.6.0.tar.gz")!
-    static let sha256 = "bd145265292f00dd26f0eea4ee980284d0dcbc60ca01a3da9857368913029851"
+    static let version = "1.13.0"
+    static let name = "nullmoth-nvidia-1.13.0.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.13.0/nullmoth-nvidia-1.13.0.tar.gz")!
+    static let sha256 = "994970b1bba53e3ae8d7f500ef27b25cae8bc6818abc112d35230a58e6882fdf"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -283,7 +283,14 @@ func failurePart(_ u: URL) -> String {
 func makeReport(_ crashes: [URL]) -> String {
     var r = ""
     for u in crashes.suffix(3) {
-        r += "\n=== \(u.lastPathComponent.replacingOccurrences(of: #"-\d{4}-\d{2}-\d{2}-\d{6}"#, with: "", options: .regularExpression)) ===\n"
+        // The date and "before this install" ride in the header: 1.12 reports carried mediaanalysisd crashes from a 1.9
+        // plugin (the return address fits only 1.3-1.9's drawPrimitives) and read as a 1.12 regression (10-11).
+        let fmc = FileManager.default
+        let when = (try? fmc.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
+        let installed = (try? fmc.attributesOfItem(atPath: "/Library/NullMoth/state"))?[.modificationDate] as? Date
+        let stamp = when.map { ISO8601DateFormatter().string(from: $0) } ?? "date unknown"
+        let old = (when != nil && installed != nil && when! < installed!) ? ", BEFORE this driver install" : ""
+        r += "\n=== \(u.lastPathComponent.replacingOccurrences(of: #"-\d{4}-\d{2}-\d{2}-\d{6}"#, with: "", options: .regularExpression)) (\(stamp)\(old)) ===\n"
         r += failurePart(u) + "\n"
     }
     return hardwareFacts() + redact(r)
@@ -392,7 +399,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "usbStop": usbWatch(false)
         case "usbWrite": usbWrite(b["sel"] as? [String: [String: Int]] ?? [:], efi: b["efi"] as? String ?? "auto")
         case "crashReport": crashReportFromWindow()
-        case "sendLogs": sendLogs()
+        case "sendLogs": sendLogs(sample: b["sample"] as? String ?? "")
         case "optionalDiagnostics": optionalDiagnostics()
         case "importDiagnosticReceipt": importDiagnosticReceipt()
         case "verbose": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--verbose", (b["on"] as? Bool ?? false) ? "on" : "off"])
@@ -641,10 +648,16 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     // report when the driver crashed, and - after macOS asks for the password - OpenCore's boot logs and saved panics
     // from every OpenCore partition (sticks included). Every file is uploaded with its SHA-256, and the site refuses
     // any upload whose bytes differ from it.
-    func sendLogs() {
+    // sample: "" = the ordinary logs; "flicker" = first 20 s of display timing taken while the screen flickers.
+    // It rides the same collector, consent and upload as Send logs.
+    func sendLogs(sample: String = "") {
+        guard ["", "flicker"].contains(sample) else { return }
         let a = NSAlert()
-        a.messageText = "Send logs to NullMoth"
+        a.messageText = sample == "flicker" ? "Record the flicker and send it to NullMoth" : "Send logs to NullMoth"
         a.informativeText = "1401 is sending this Mac's NullMoth logs to nullmothsystems.com so the problem can be found and fixed: what 1401 did, the driver's state, driver crash reports, recent WindowServer, Firefox and Blender crash reports, update diagnostics, OpenCore's startup logs, and a numeric device/CPU relationship map. A separately imported diagnostics receipt is included only if that session allowed upload, and only as a validated count/configuration summary. The map records kernel-visible hardware, not verified driver support. Your name, your Mac's name, serial numbers and addresses are removed first. macOS asks for your password so 1401 can read the startup logs."
+        if sample == "flicker" {
+            a.informativeText = "Start this while the screen is flickering. For 20 seconds 1401 records how the driver puts frames on the display (flip counts and timing, refused updates, the refresh rate and WindowServer's load), then sends it with the ordinary logs. Keep using the Mac normally while it records.\n\n" + a.informativeText
+        }
         a.addButton(withTitle: "Send"); a.addButton(withTitle: "Cancel")
         guard a.runModal() == .alertFirstButtonReturn else { send("logsDone", ["ok": false, "why": "Not sent."]); return }
         DispatchQueue.global().async {
@@ -659,7 +672,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             }
             let script = Bundle.main.resourceURL!.appendingPathComponent("nullmoth-log-capture.sh").path
             let q = { (x: String) in "'" + x.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-            let cmd = "/bin/bash \(q(script))"
+            let cmd = (sample.isEmpty ? "" : "NULLMOTH_SAMPLE=\(sample) ") + "/bin/bash \(q(script))"
             var collectionErrors: [String] = []
             DispatchQueue.main.async {
                 self.send("logsStatus", ["text": "Waiting for your Mac password (a macOS window asks for it). Collecting takes a few minutes; 1401 keeps working."])
@@ -690,9 +703,14 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             }
             var files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? [])
             let sessions = (try? fm.contentsOfDirectory(at: logs.appendingPathComponent("Reports"), includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            // Setup logs written before this app was built came from an older setup script. 1.11 sent 1.10's
+            // "AMFIPass.kext is not in this OpenCore EFI" stops under a 1.11 label (10-11: 13 uploads), beside the
+            // newer run that had already fixed it. Pending files are kept: they are uploads that have not gone out yet.
+            let built = Bundle.main.executableURL.flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate } ?? .distantPast
             let retained = sessions.filter { $0 != dir }.flatMap { session in
                 ((try? fm.contentsOfDirectory(at: session, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
-                    .filter { $0.lastPathComponent.hasPrefix("setup-") || $0.lastPathComponent.hasPrefix("pending-") }
+                    .filter { $0.lastPathComponent.hasPrefix("pending-") || ($0.lastPathComponent.hasPrefix("setup-") &&
+                        ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >= built) }
             }
             let mine = ((try? fm.contentsOfDirectory(at: logs, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [])
                 .sorted { ((try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast) >
@@ -732,7 +750,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             if err != nil { errs.append("Some system logs could not be collected. See collect.txt for details.") }
             // Directory enumeration is unordered: a stick with many boot logs could crowd out
             // the GPU state, kernel log, or crash report. Always send those first.
-            let important = ["hardware-map.json", "driver-state.txt", "driver-kernel-log.txt", "driver-plugin-log.txt", "crash-report.txt", "diagnostic-session.json", "collect.txt", "driver-update-log.txt"]
+            let important = ["hardware-map.json", "driver-state.txt", "driver-kernel-log.txt", "driver-display.txt", "previous-boot-kernel-log.txt", "display-trace.txt", "display-kernel.txt", "display-ws.txt", "driver-plugin-log.txt", "crash-report.txt", "driver-wsreset.log.txt", "diagnostic-session.json", "collect.txt", "driver-update-log.txt"]
             files.sort {
                 let a = supportCrashRank($0.lastPathComponent) ?? (important.firstIndex(of: $0.lastPathComponent) ?? important.count)
                 let b = supportCrashRank($1.lastPathComponent) ?? (important.firstIndex(of: $1.lastPathComponent) ?? important.count)
@@ -809,7 +827,10 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         let log: URL
         do {
             let directory = try SavedReports.session(in: logs.appendingPathComponent("Reports"))
-            log = try SavedReports.create(Data("Setup \(mode) started.\n".utf8), in: directory, name: "setup-\(mode).log")
+            // The version and time ride in the log itself: a sent log is otherwise unattributable once it is retained.
+            let stamp = ISO8601DateFormatter().string(from: Date())
+            let app = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+            log = try SavedReports.create(Data("Setup \(mode) started (1401 Mac \(app), driver \(Package.version), \(stamp)).\n".utf8), in: directory, name: "setup-\(mode).log")
         } catch {
             runningSetup = false
             send("run", ["state": "end", "mode": mode, "ok": false, "why": "Could not save a local report: \(error.localizedDescription)"])
