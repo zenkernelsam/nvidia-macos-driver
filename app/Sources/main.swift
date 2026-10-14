@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "1.14.2"
-    static let name = "nullmoth-nvidia-1.14.2.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.14.2/nullmoth-nvidia-1.14.2.tar.gz")!
-    static let sha256 = "7c7f7ac97dbcdd48786d4384ffcb2d19199b6d3bc0fb013c71f63b766dea6be5"
+    static let version = "1.15.0"
+    static let name = "nullmoth-nvidia-1.15.0.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.15.0/nullmoth-nvidia-1.15.0.tar.gz")!
+    static let sha256 = "6101cf8c37e4a500059ea8ce4d9f131ea107e35ccbeafcbb124d78a97e37e3ec"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -284,7 +284,7 @@ func makeReport(_ crashes: [URL]) -> String {
     var r = ""
     for u in crashes.suffix(3) {
         // The date and "before this install" ride in the header: 1.12 reports carried mediaanalysisd crashes from a 1.9
-        // plugin (the return address fits only 1.3-1.9's drawPrimitives) and read as a 1.12 regression (10-11).
+        // plugin (the return address fits only 1.3-1.9's drawPrimitives) and read as a 1.12 regression.
         let fmc = FileManager.default
         let when = (try? fmc.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
         let installed = (try? fmc.attributesOfItem(atPath: "/Library/NullMoth/state"))?[.modificationDate] as? Date
@@ -416,6 +416,11 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     }
 
     func scan() -> [String: Any] { App.scanMac(table) }
+    static func loadedDriverComponentCount(_ listing: String) -> Int {
+        let expected: Set<String> = ["com.nullmoth.NVRM", "com.nullmoth.NVRMFB", "com.nullmoth.NVAccel", "com.nullmoth.NVRMAGDC"]
+        let words = Set(listing.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+        return expected.intersection(words).count
+    }
     static func scanMac(_ table: [String: Any]) -> [String: Any] {
         let ids = table["ids"] as? [String: String] ?? [:], tested = table["tested"] as? [String] ?? []
         let gpus: [[String: Any]] = pciDisplays().map { g in
@@ -428,7 +433,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let oc = sh("/usr/sbin/nvram", ["4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version"])
             .split(separator: "\t").dropFirst().first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
-        let kexts = sh("/usr/bin/kmutil", ["showloaded", "--list-only"]).split(separator: "\n").filter { $0.contains("com.nullmoth.") }.count
+        let kexts = loadedDriverComponentCount(sh("/usr/bin/kmutil", ["showloaded", "--list-only"]))
         let fm = FileManager.default
         let files = fm.fileExists(atPath: "/Library/GPUBundles/NVMTLDriver.bundle") && fm.fileExists(atPath: "/Library/Extensions/NVRM.kext")
         var arch = "x86_64"
@@ -438,7 +443,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         let safe = sh("/usr/sbin/nvram", ["boot-args"]).split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains("-nvoff")
         return ["macos": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)", "major": os.majorVersion, "arch": arch,
                 "gpus": gpus, "opencore": oc, "kexts": kexts, "files": files, "metal": MTLCopyAllDevices().map { $0.name },
-                "packages": findPackages(), "version": Package.version, "safemode": safe,
+                "packages": findPackages(), "version": Package.version, "installedDriverVersion": recordedDriverVersion(), "safemode": safe,
                 "record": fm.fileExists(atPath: "/Library/NullMoth/state"), "crashes": driverCrashes().map(\.lastPathComponent),
                 "translated": sysctl("sysctl.proc_translated") == "1",
                 "profile": { var p = machineProfile(gpus); p["rules"] = Profile.select(rules(), p).ids; return p }()]
@@ -521,9 +526,10 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         for i in 0..<max(x.count, y.count) { let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0; if p != q { return p > q } }
         return false
     }
-    func installedDriverVersion() -> String {
+    static func recordedDriverVersion() -> String {
         (try? String(contentsOfFile: "/Library/NullMoth/driver-version", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
+    func installedDriverVersion() -> String { App.recordedDriverVersion() }
     func checkUpdate() {
         let api = URL(string: "https://api.github.com/repos/nullmoth/nvidia-macos-driver/releases/latest")!
         var rq = URLRequest(url: api); rq.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept"); rq.timeoutInterval = 30
@@ -563,7 +569,9 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         }.resume()
     }
     func startDownload(name: String, sha: String, url: URL, efi: String?) {
-        guard pendingDownload == nil, !runningSetup else { return }
+        // A click while busy used to return silently, leaving "Downloading the newest driver..." on screen for good.
+        if pendingDownload != nil { send("dl", ["state": "error", "why": "a download is already running; wait for it to finish"]); return }
+        if runningSetup { send("dl", ["state": "error", "why": "setup is still running; try again when it has finished"]); return }
         do { try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true) }
         catch { send("dl", ["state": "error", "why": error.localizedDescription]); return }
         let task = downloadSession.downloadTask(with: url)
@@ -907,6 +915,24 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             send("run", ["state": "end", "mode": mode, "ok": false, "why": "Could not save a local report: \(error.localizedDescription)"])
             return
         }
+        // macOS checks its Removable Volumes privacy setting against this app even for the root shell that runs setup, so
+        // a USB stick's OpenCore config could not be opened there ("Code=257", seven Macs on 1.10 to 1.14.5, reported as
+        // "no OpenCore config"). Opening it here first lets macOS ask the user in 1401's name before setup needs it.
+        // Off the main thread and bounded: a stalled stick or a spun-down disk must not freeze the window (1.15 review).
+        // Network volumes are skipped: OpenCore never starts from them, and an unreachable share would only add a wait.
+        let preread = DispatchGroup()
+        DispatchQueue.global(qos: .userInitiated).async(group: preread) {
+            for volume in FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeIsInternalKey, .volumeIsLocalKey], options: [.skipHiddenVolumes]) ?? [] {
+                let values = try? volume.resourceValues(forKeys: [.volumeIsInternalKey, .volumeIsLocalKey])
+                if values?.volumeIsInternal == true || values?.volumeIsLocal == false { continue }
+                for rel in ["EFI/OC/config.plist", "EFI/BOOT/config.plist"] {
+                    let file = volume.appendingPathComponent(rel)
+                    guard FileManager.default.fileExists(atPath: file.path), let handle = FileHandle(forReadingAtPath: file.path) else { continue }
+                    _ = handle.readData(ofLength: 1); handle.closeFile()
+                }
+            }
+        }
+        _ = preread.wait(timeout: .now() + 3)
         let res = Bundle.main.resourceURL!
         var args: [String]
         switch mode {

@@ -26,8 +26,9 @@ TOOL_NAME="1401: Remove NVIDIA driver"; TOOL_FILE=NullMothSafe.efi
 # the same tool with Arguments "once": macOS starts one time without the driver (to reach Recovery, or to get past a bad
 # start), and the driver is back after that - OpenCore rewrites boot-args at every start. Asked for on Discord 10-11.
 ONCE_NAME="1401: Start once without NVIDIA driver"
-# the NullMoth boot logo (an OpenCore driver that draws it where boot.efi draws the Apple logo). On unless --logo off.
-LOGO=on; LOGO_FILE=NullMothLogo.efi
+# Optional cosmetic EFI driver; default installations keep the standard boot display.
+# Reported firmware hangs make this an explicit opt-in rather than an installation prerequisite.
+LOGO=off; LOGO_FILE=NullMothLogo.efi
 ST=${NULLMOTH_STATE_DIR:-/Library/NullMoth}; STATE=$ST/state
 AGENT=/Library/LaunchAgents/com.nullmoth.crashcheck.plist
 RECOVER=/Library/LaunchDaemons/com.nullmoth.recover.plist
@@ -93,8 +94,12 @@ fetch_kext() {
   local k=$1 u s
   [ -n "$KT" ] || KT=$(mktemp -d) || stop "could not create a download folder"
   read -r u s <<<"$(kurl $k)"
-  curl -fsSL --max-time 180 -o "$KT/$k.zip" "$u" \
-    || stop "$k could not be downloaded ($u). Check the internet connection and try again, or put $k in $2"
+  # GitHub first, then the same bytes from nullmothsystems.com/mirror/<sha256> (the mirror 1401 uses). Four 1.14.7 setups
+  # stopped on "curl: (56) Recv failure: Operation timed out" at raw.githubusercontent.com, which some networks block.
+  # The SHA-256 below is checked whichever source answered.
+  curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 --retry-delay 3 -o "$KT/$k.zip" "$u" \
+    || curl -fsSL --connect-timeout 20 --max-time 180 --retry 3 --retry-delay 3 -o "$KT/$k.zip" "https://nullmothsystems.com/mirror/$s" \
+    || stop "$k could not be downloaded ($u, or the NullMoth mirror). Check the internet connection and try again, or put $k in $2"
   [ "$(shasum -a 256 "$KT/$k.zip" | awk '{print $1}')" = "$s" ] || stop "$k download did not match its SHA-256; nothing was changed. Try again"
   ditto -x -k "$KT/$k.zip" "$KT/$k.x" && [ -f "$KT/$k.x/$k/Contents/Info.plist" ] || stop "$k download could not be unpacked; nothing was changed"
 }
@@ -133,6 +138,23 @@ on_usb() {      # true when the partition is on an external or removable disk (a
   diskutil info "$1" 2>/dev/null | grep -q -E 'Removable Media: *(Removable|Yes)|Device Location: *External|Protocol: *USB'; }
 bidx() { local i=0 p; while p=$(plutil -extract Kernel.Block.$i.Identifier raw -o - "$C" 2>/dev/null); do [ "$p" = com.apple.iokit.IONDRVSupport ] && { echo $i; return; }; i=$((i+1)); done; }
 
+# Every log query has its own time cap. Measured 10-12 on a 15.8.1 machine: three "--last 3d" queries took 85 s, 120 s
+# and over 230 s, so the 180 s collection limit killed the job before the kernel log was written (36 of 94 reports since
+# 1.14.0 arrived without it). A capped query keeps what it printed and says that it was cut.
+lshow() {  # <seconds> <log show arguments...>
+  local secs=$1 p w rc; shift
+  /usr/bin/log show "$@" & p=$!
+  ( sleep "$secs" >/dev/null 2>&1; kill "$p" 2>/dev/null && echo "(log query stopped after ${secs} s)" ) & w=$!
+  wait "$p"; rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return $rc
+}
+# Keeps the first $1 and the last $2 lines of its input, with a marker between: a boot's start (where a GPU driver
+# says whether it started) and its end (what the user saw last). WAS a plain tail: on an RX 7900 XTX + RTX 2060 machine
+# Per-allocation lines filled the 512 KB upload, and the test driver's start-up lines were gone.
+headtail() { awk -v h="$1" -v t="$2" 'NR <= h { print; next } { r[NR % t] = $0 }
+  END { if (NR > h) { s = (NR - t > h) ? NR - t + 1 : h + 1; if (s > h + 1) printf "... %d lines left out ...\n", s - h - 1
+        for (i = s; i <= NR; i++) print r[i % t] } }'; }
 # Copy newest files without splitting volume or file names at whitespace.
 collect_recent_logs() {
   local prefix=$1 limit=$2 f i; shift 2
@@ -206,10 +228,15 @@ if [ -n "$COLLECT" ]; then
     echo; echo "== display bring-up"; sysctl kern.boottime debug.nvaccel_heads_published debug.nvaccelfb debug.nvrmfb_agdc debug.nvaccel_iop 2>&1
     } > "$COLLECT/driver-state.txt" 2>&1
   # the kernel's own words from the last boots: NVRM/NVAccel/NVRMFB print why they stopped (GSP boot, BAR, display).
+  # The AMD/Intel test driver (NMXGPU, NMXAccel, amdgpu/i915/xe and DRM inside it) is in here too: before 1.14.4 none of
+  # its lines were collected, so three machines that turned it on (one an RX 7900 XTX, 10-12) told us nothing.
   # A boot that hung early may not have reached the log store; a later boot's panic report then carries it.
-  log show --last 3d --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "nvidia" OR eventMessage CONTAINS[c] "nullmoth" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
+  boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
+  lshow 45 --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "nvidia" OR eventMessage CONTAINS[c] "nullmoth" OR eventMessage CONTAINS[c] "gsp" OR eventMessage CONTAINS[c] "nmx" OR eventMessage CONTAINS[c] "amdgpu" OR eventMessage CONTAINS[c] "i915" OR eventMessage CONTAINS "[drm]" OR eventMessage CONTAINS "xe " OR sender == "NMXGPU" OR sender == "NMXAccel" OR sender == "NMXNPU" OR sender == "NMIntelFB")' 2>&1 \
     | grep -v -e 'NVRM-fb: kapi event type 5$' -e 'NVRM-xnu: >os_map_kernel_space' -e 'NVRM-fb: flipToMemory #' \
-    | tail -n 6000 > "$COLLECT/driver-kernel-log.txt"
+             -e 'NVAccel: newVidMemory -> ' -e 'NVVidMemory::allocPhysical(.*bytes of REAL VRAM' \
+    | headtail 1500 1500 > "$COLLECT/driver-kernel-log.txt"
+  log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-kernel-log.txt"
   # 1.9.0 report (10-10, 2K 165 Hz monitor stuck at 1080p 60 Hz): the 6000-line tail above was all os_map_kernel_space
   # and flipToMemory lines, so the boot-time mode list, the EDID and why each mode was or was not offered were gone.
   # Everything the display decision used, from THIS boot only, never tailed away.
@@ -219,12 +246,11 @@ if [ -n "$COLLECT" ]; then
     ioreg -l -w0 -r -c NVRMNVDAFramebuffer 2>/dev/null | grep -E '"(IOFB[A-Za-z]*(Mode|Timing|Pixel|Display)[A-Za-z]*|nvrm[A-Za-z-]*|NVRM[A-Za-z]*|IOFBDependentIndex)"'
     echo; echo "== framebuffer messages since this boot"
     boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
-    log show --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
+    lshow 30 --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
       --predicate 'process == "kernel" AND (eventMessage CONTAINS "NVRM-fb" OR eventMessage CONTAINS "nvkms")' 2>&1 \
       | grep -v -e 'kapi event type 5$' -e 'flipToMemory #' | head -n 4000
   } > "$COLLECT/driver-display.txt" 2>&1
-  # Every GPU and the processor, whatever the vendor and age, supported by NullMoth or not (Jake 10-11: "open macOS up
-  # for everyone"). The sections above only name NVIDIA; Intel iGPUs (HD to Xe and Arc), Radeon cards and Ryzen iGPUs
+  # Every GPU and the processor, whatever the vendor and age, supported by NullMoth or not (requested broad hardware coverage). The sections above only name NVIDIA; Intel iGPUs (HD to Xe and Arc), Radeon cards and Ryzen iGPUs
   # need the same facts: what macOS bound to them, whether Metal sees them, and what the boot loader injected.
   { echo "== every display device (any vendor)"
     ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | LC_ALL=C awk '
@@ -243,14 +269,13 @@ if [ -n "$COLLECT" ]; then
     sysctl machdep.cpu hw.physicalcpu hw.logicalcpu hw.memsize hw.cpufrequency hw.packages 2>/dev/null
     echo; echo "== graphics messages since this boot (non-NVIDIA drivers)"
     boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
-    log show --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
+    lshow 20 --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
       --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "igfx" OR eventMessage CONTAINS[c] "IntelAccel" OR eventMessage CONTAINS[c] "AppleIntel" OR eventMessage CONTAINS[c] "AMDRadeon" OR eventMessage CONTAINS[c] "ATIController" OR eventMessage CONTAINS[c] "AMDFramebuffer" OR eventMessage CONTAINS[c] "NMIntelFB" OR eventMessage CONTAINS[c] "WhateverGreen" OR eventMessage CONTAINS[c] "IOAccel")' 2>&1 | head -n 3000
   } > "$COLLECT/gpu-all.txt" 2>&1
-  log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-kernel-log.txt"
   # The current kernel message ring can retain early GSP/BAR failures absent from the log store.
-  { echo; echo "== current kernel message ring"; dmesg 2>&1 | grep -iE 'nvrm|nvaccel|nvidia|nullmoth|gsp' | tail -n 2000; } >> "$COLLECT/driver-kernel-log.txt"
+  { echo; echo "== current kernel message ring"; dmesg 2>&1 | grep -iE 'nvrm|nvaccel|nvidia|nullmoth|gsp|nmx|amdgpu|i915|\[drm\]' | grep -v -e 'newVidMemory -> ' -e 'bytes of REAL VRAM' | headtail 300 300; } >> "$COLLECT/driver-kernel-log.txt"
   # Keep update/snapshot context separate so APFS traffic cannot crowd out GPU errors.
-  log show --last 3d --style compact --predicate '(process == "kernel" AND eventMessage CONTAINS[c] "apfs") OR process == "MobileSoftwareUpdate" OR process == "softwareupdated"' 2>&1 \
+  lshow 20 --last 1d --style compact --predicate '(process == "kernel" AND eventMessage CONTAINS[c] "apfs") OR process == "MobileSoftwareUpdate" OR process == "softwareupdated"' 2>&1 \
     | tail -n 2000 > "$COLLECT/driver-update-log.txt"
   log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-update-log.txt"
   { echo; echo "== current update message ring"; dmesg 2>&1 | grep -iE 'apfs|MobileSoftwareUpdate|softwareupdated' | tail -n 1000; } >> "$COLLECT/driver-update-log.txt"
@@ -270,17 +295,21 @@ if [ -n "$COLLECT" ]; then
   }
   console_user=$(stat -f %Su /dev/console 2>/dev/null)
   NPUDIR=/Library/NullMoth/npu
-  {
-    echo "== NPU PCI functions (Intel class 12xxxx, AMD signal-processing 1180xx) and their properties"
-    # ioreg lists a device's properties alphabetically (class-code before vendor-id), so each device is judged at its end
-    ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | LC_ALL=C awk '
+  # The runtime probes below (compiler check, OpenVINO, XRT) and the userland hashes ran on every Mac with the NPU
+  # userland installed, NPU or not, and alone could outlast the whole collection limit: 7 of 28 1.14.7 reports came
+  # back without their kernel log (status 124). They now run only where an NPU PCI function exists, each bounded short.
+  npu_pci=$(ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | LC_ALL=C awk '
       function out() { if ((cls=="12" && v=="intel") || (cls=="1180" && v=="amd")) print block "\n" }
       /\+-o / { out(); block=$0; cls=""; v=""; next }
       /"vendor-id" = <8680/ { v="intel" } /"vendor-id" = <2210/ { v="amd" }
       /"class-code" = <[0-9a-f][0-9a-f][0-9a-f][0-9a-f]1200>/ { cls="12" }
       /"class-code" = <[0-9a-f][0-9a-f]801100>/ { cls="1180" }
       /"(vendor-id|device-id|subsystem-vendor-id|subsystem-id|revision-id|class-code|IOName|IOPCIExpressLinkStatus|IOPCIResourced|assigned-addresses|acpi-path)"/ { block=block "\n" $0 }
-      END { out() }'
+      END { out() }')
+  {
+    echo "== NPU PCI functions (Intel class 12xxxx, AMD signal-processing 1180xx) and their properties"
+    # ioreg lists a device's properties alphabetically (class-code before vendor-id), so each device is judged at its end
+    if [ -n "$npu_pci" ]; then printf '%s\n' "$npu_pci"; else echo "(no NPU PCI function: runtime probes skipped)"; fi
     echo; echo "== what attached to them (NMXNPU is the NPU driver)"
     ioreg -r -c NMXNPU -l -w0 2>/dev/null | head -60 || true
     echo; echo "== NPU boot arguments"; nvram boot-args 2>/dev/null | tr ' \t' '\n\n' | grep -E 'nmx|npu' || echo "(none)"
@@ -294,20 +323,20 @@ if [ -n "$COLLECT" ]; then
     echo; echo "== NPU firmware"; ls -la /Library/NullMoth/firmware/intel/vpu /Library/NullMoth/firmware/amdnpu/* 2>&1 | head -40
     echo; echo "== device nodes"; ls -la /dev/accel 2>&1
     echo; echo "== each node: driver, PCI identity, driver attributes (nmx-npu-probe)"
-    if [ -x "$NPUDIR/bin/nmx-npu-probe" ]; then npu_run 20 "$NPUDIR/bin/nmx-npu-probe"; else echo "(nmx-npu-probe not installed)"; fi
+    if [ -n "$npu_pci" ] && [ -x "$NPUDIR/bin/nmx-npu-probe" ]; then npu_run 20 "$NPUDIR/bin/nmx-npu-probe"; else echo "(nmx-npu-probe not installed)"; fi
     echo; echo "== NPU userland installed (sha256)"
-    if [ -d "$NPUDIR" ]; then find "$NPUDIR" -type f ! -name '*.a' -exec shasum -a 256 {} + 2>&1 | sed "s|$NPUDIR/||" | head -200; ls -la "$NPUDIR/xrt/share/amdxdna/bins" 2>&1
+    if [ -d "$NPUDIR" ]; then find "$NPUDIR" -type f ! -name '*.a' 2>/dev/null | head -200 | tr '\n' '\0' | xargs -0 shasum -a 256 2>&1 | sed "s|$NPUDIR/||"; ls -la "$NPUDIR/xrt/share/amdxdna/bins" 2>&1
     else echo "(no $NPUDIR)"; fi
     echo; echo "== Intel: the NPU compiler on a small network (Meteor/Arrow Lake 3720, Lunar Lake 4000; needs no NPU)"
-    if [ -x "$NPUDIR/bin/nmx-npu-compile-check" ]; then npu_run 300 "$NPUDIR/bin/nmx-npu-compile-check"
+    if [ -n "$npu_pci" ] && [ -x "$NPUDIR/bin/nmx-npu-compile-check" ]; then npu_run 60 "$NPUDIR/bin/nmx-npu-compile-check"
     else echo "(nmx-npu-compile-check not installed)"; fi
     echo; echo "== Intel: OpenVINO devices with Level Zero, the NPU driver and the NPU plugin logging"
-    if [ -x "$NPUDIR/openvino/bin/hello_query_device" ]; then
-      npu_run 90 env ZE_ENABLE_LOADER_DEBUG_TRACE=1 ZE_INTEL_NPU_LOGLEVEL=INFO OV_NPU_LOG_LEVEL=LOG_INFO \
+    if [ -n "$npu_pci" ] && [ -x "$NPUDIR/openvino/bin/hello_query_device" ]; then
+      npu_run 45 env ZE_ENABLE_LOADER_DEBUG_TRACE=1 ZE_INTEL_NPU_LOGLEVEL=INFO OV_NPU_LOG_LEVEL=LOG_INFO \
         "$NPUDIR/openvino/bin/hello_query_device"
-    else echo "(OpenVINO not installed)"; fi
+    else echo "(no NPU, or OpenVINO not installed)"; fi
     echo; echo "== AMD: xrt-smi examine, then examine and validate on each AMD NPU, with XRT's runtime log on"
-    if [ -x "$NPUDIR/xrt/bin/xrt-smi" ]; then
+    if [ -n "$npu_pci" ] && [ -x "$NPUDIR/xrt/bin/xrt-smi" ]; then
       ini=$(sudo -u "$console_user" mktemp -d /tmp/nullmoth-xrt.XXXXXX 2>/dev/null)/xrt.ini
       if [ -n "$console_user" ] && [ "$ini" != /xrt.ini ]; then
         printf '[Runtime]\nverbosity=7\nruntime_log=console\n' | sudo -u "$console_user" tee "$ini" > /dev/null
@@ -315,17 +344,17 @@ if [ -n "$COLLECT" ]; then
       npu_run 60 env XRT_INI_PATH="$ini" "$NPUDIR/xrt/bin/xrt-smi" examine
       for bdf in $("$NPUDIR/bin/nmx-npu-probe" 2>/dev/null | awk '/^  driver amdxdna/ {a=1} a && /^  pci / {print $2; a=0}'); do
         echo; echo "-- examine -d $bdf -r all"; npu_run 60 env XRT_INI_PATH="$ini" "$NPUDIR/xrt/bin/xrt-smi" examine -d "$bdf" -r all
-        echo; echo "-- validate -d $bdf"; npu_run 240 env XRT_INI_PATH="$ini" "$NPUDIR/xrt/bin/xrt-smi" validate -d "$bdf"
+        echo; echo "-- validate -d $bdf"; npu_run 60 env XRT_INI_PATH="$ini" "$NPUDIR/xrt/bin/xrt-smi" validate -d "$bdf"
       done
       [ "$ini" = /xrt.ini ] || rm -rf "$(dirname "$ini")"
     else echo "(XRT not installed)"; fi
     echo; echo "== NPU kernel messages since this boot"
     boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
-    log show --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
+    lshow 15 --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact \
       --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "NMXNPU" OR eventMessage CONTAINS[c] "ivpu" OR eventMessage CONTAINS[c] "intel_vpu" OR eventMessage CONTAINS[c] "amdxdna" OR eventMessage CONTAINS[c] "xdna" OR eventMessage CONTAINS "NullMoth drm")' 2>&1 | head -n 4000
     echo; echo "== NPU messages in the kernel ring"; dmesg 2>&1 | grep -iE 'nmxnpu|ivpu|intel_vpu|amdxdna|xdna|nullmoth drm' | tail -n 1000
-    echo; echo "== app messages from the NPU runtimes, last 3 days"
-    log show --last 3d --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "ze_intel_npu" OR eventMessage CONTAINS[c] "level_zero" OR eventMessage CONTAINS[c] "openvino" OR eventMessage CONTAINS[c] "xrt" OR eventMessage CONTAINS[c] "amdxdna")' 2>&1 | tail -n 2000
+    echo; echo "== app messages from the NPU runtimes, since this boot"
+    lshow 15 --start "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "ze_intel_npu" OR eventMessage CONTAINS[c] "level_zero" OR eventMessage CONTAINS[c] "openvino" OR eventMessage CONTAINS[c] "xrt" OR eventMessage CONTAINS[c] "amdxdna")' 2>&1 | tail -n 2000
   } > "$COLLECT/npu.txt" 2>&1
   # crash reports of processes that had the NPU runtimes loaded (newest three)
   n_npu=0
@@ -337,7 +366,7 @@ if [ -n "$COLLECT" ]; then
   done
   # Release builds report failures to syslog rather than nvmtl.log. Debug builds may use either
   # the system temp directory or the console user's temp directory.
-  log show --last 3d --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason")' 2>&1 \
+  lshow 40 --last 1d --style compact --predicate 'process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason")' 2>&1 \
     | tail -n 3000 > "$COLLECT/driver-plugin-log.txt"
   log_status=${PIPESTATUS[0]}; echo "log show exit: $log_status" >> "$COLLECT/driver-plugin-log.txt"
   console_user=$(stat -f %Su /dev/console 2>/dev/null)
@@ -366,12 +395,12 @@ if [ -n "$COLLECT" ]; then
       # Separate budgets: on a busy GPU the kernel lines alone filled a shared 1500-line tail and pushed out the
       # plugin's and WindowServer's own reason (measured: 1482 of 1500 lines were kernel lines).
       echo "-- plugin and WindowServer errors"
-      log show --start "$from" --end "$to" --style compact --predicate '(process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason" OR eventMessage CONTAINS[c] "MetalDevice")) OR (process == "WindowServer" AND (messageType == error OR messageType == fault))' 2>&1 \
+      lshow 20 --start "$from" --end "$to" --style compact --predicate '(process != "kernel" AND (eventMessage CONTAINS[c] "NVMTL" OR eventMessage CONTAINS[c] "NullMoth" OR eventMessage CONTAINS[c] "nvk-reason" OR eventMessage CONTAINS[c] "MetalDevice")) OR (process == "WindowServer" AND (messageType == error OR messageType == fault))' 2>&1 \
         | awk -v to="$to" '!/^20[0-9][0-9]-/ || substr($0, 1, 19) <= to' \
         | tail -n 700
       echo "log show exit: ${PIPESTATUS[0]}"
       echo "-- kernel driver lines"
-      log show --start "$from" --end "$to" --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
+      lshow 20 --start "$from" --end "$to" --style compact --predicate 'process == "kernel" AND (eventMessage CONTAINS[c] "nvrm" OR eventMessage CONTAINS[c] "nvaccel" OR eventMessage CONTAINS[c] "gsp")' 2>&1 \
         | awk -v to="$to" '!/^20[0-9][0-9]-/ || substr($0, 1, 19) <= to' \
         | tail -n 800
       echo "log show exit: ${PIPESTATUS[0]}"
@@ -388,7 +417,7 @@ if [ -n "$COLLECT" ]; then
   # before this one, up to this boot's start: the tail is how the last failed boot ended.
   { boot=$(sysctl -n kern.boottime | sed -E 's/.*sec = ([0-9]+),.*/\1/')
     echo "== kernel messages before this boot (started $(date -r "$boot" '+%Y-%m-%d %H:%M:%S'))"
-    log show --start "$(date -r $((boot - 259200)) '+%Y-%m-%d %H:%M:%S')" --end "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" \
+    lshow 45 --start "$(date -r $((boot - 43200)) '+%Y-%m-%d %H:%M:%S')" --end "$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" \
       --style compact --predicate 'process == "kernel"' 2>&1 \
       | grep -v -e 'NVRM-fb: kapi event type 5$' -e 'NVRM-xnu: >os_map_kernel_space' -e 'NVRM-fb: flipToMemory #' \
       | awk -v end="$(date -r "$boot" '+%Y-%m-%d %H:%M:%S')" '
@@ -407,10 +436,14 @@ if [ -n "$COLLECT" ]; then
     mount_efi "$d" || continue; mp=$MOUNT_POINT
     collect_recent_logs "$d" 3 "$mp"/opencore-*.txt
     collect_recent_logs "$d" 5 "$mp"/panic-*.txt
-    # The EFI itself (10-09): most machines that fail run their own OpenCore config, and without it every fix was a
+    # The EFI itself: most machines that fail run their own OpenCore config, and without it every fix was a
     # guess from symptoms. The config goes up with the machine's identity removed (serial, board serial, UUID, ROM),
     # plus the list of kexts, drivers and ACPI files beside it, so the working and the broken EFIs can be compared.
-    for cf in "$mp"/EFI/OC/config.plist "$mp"/EFI/OC/config.plist.nullmoth-*; do
+    # The live config and its two newest backups only: every install leaves a backup, and 35 of them on one test machine
+    # filled the report's 48 file slots before the panics, crash reports and GPU logs were reached.
+    cfs=("$mp"/EFI/OC/config.plist)   # a volume name can hold spaces ("NO NAME"): read paths line by line, never split them
+    while IFS= read -r cf; do cfs+=("$cf"); done < <(ls -t "$mp"/EFI/OC/config.plist.nullmoth-* 2>/dev/null | head -n 2)
+    for cf in "${cfs[@]}"; do
       [ -f "$cf" ] || continue
       out="$COLLECT/$d-efi-$(basename "$cf").txt"
       cp "$cf" "$out.plist" || { collection_errors=$((collection_errors+1)); continue; }
@@ -605,6 +638,17 @@ else
       diskutil list 2>&1 | grep -E '^ +[0-9]+:|^/dev/' | head -n 40 | sed 's/^/NOTE disks: /'
       [ -n "$clover" ] && ! nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version >/dev/null 2>&1 && \
         stop "this Mac starts with Clover, not OpenCore - the NVIDIA driver's settings are made for OpenCore. Make an OpenCore setup (1401 on Windows builds one), start from it, then run this again"
+      # 10-12 (seven Macs, 1401 Mac 1.10 to 1.14.5): the stick's config was there and plutil answered "Code=257" (no
+      # permission). macOS checks its Removable Volumes privacy setting against the 1401 app even for this root shell,
+      # so a stick's files cannot be opened until the user allows it. Say that, not "no OpenCore config".
+      denied=""; for d in $(diskutil list | awk '/ EFI | DOS_FAT_32 | Windows_FAT_32 | Microsoft Basic Data /{print $NF}' | grep -E '^disk[0-9]+s[0-9]+$'); do
+        mount_efi "$d" || continue; mp=$MOUNT_POINT
+        for c in "$mp/EFI/OC/config.plist" "$mp/EFI/BOOT/config.plist"; do
+          [ -e "$c" ] && ! head -c 1 "$c" >/dev/null 2>&1 && { denied="$denied $d"; break; }; done; done
+      # six of the 10-12 reports: OpenCore's boot path was a USB device (the 1401 stick) that was no longer connected
+      nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path 2>/dev/null | grep -q 'USB(' && [ -z "$denied" ] && \
+        stop "this Mac started OpenCore from a USB stick that is not connected now - plug that stick back in (the one you start the Mac from), then try again"
+      [ -n "$denied" ] && stop "macOS is not letting 1401 read the OpenCore config on$denied. Open System Settings > Privacy & Security > Files & Folders, turn on Removable Volumes for 1401 (or add 1401 under Full Disk Access), then try again"
       stop "no OpenCore config for this Mac ($(sysctl -n hw.model)) on any connected disk - plug in the disk or USB stick OpenCore started from, then try again (the NOTE lines above show what each partition holds)"
     fi
     # A shared SMBIOS model or the macOS disk does not identify the booted EFI.
@@ -1012,7 +1056,7 @@ lp=$(kpos Lilu.kext); ap=$(kpos AMFIPass.kext)
 NEEDAMFIPASS=$(( ${#ADDK[@]} + ${#FETCH[@]} ))
 # Tahoe preparation: macOS 26 refuses Mac models it dropped ("This version of Mac OS X is not supported on this platform").
 # Every desktop 1401 built before 1.14 is iMacPro1,1, one of them, so the update stopped there on every such PC (10-12, the
-# studio itself). Desktops take MacPro7,1, which runs macOS 15 and 26, with RestrictEvents (its memory and PCI slot pages),
+# the test machine). Desktops take MacPro7,1, which runs macOS 15 and 26, with RestrictEvents (its memory and PCI slot pages),
 # as 1401 1.14 builds them; a laptop on a dropped model is told to rebuild its EFI with 1401 1.14 (its model needs the
 # laptop's own SMBIOS choice). The serial numbers stay: macOS does not check them against the model.
 if [ "$UPD" = prepare ]; then
@@ -1045,19 +1089,11 @@ if [ "$UPD" = prepare ]; then
       fi ;;
   esac
 fi
-# The macOS installer boots with a small GPU BAR (ResizeAppleGpuBars 0, so its fallback screen survives PCI setup); the
-# driver was tested with the card's full 8 GB BAR, so the installed system gets that back.
+# Existing BAR and kernel-placement settings belong to the EFI that started this system.
+# A fixed 8 GB resize hung reported firmware before the picker, and updates must not
+# replace a working firmware configuration with one tested on a different board.
 bar=$(get UEFI.Quirks.ResizeGpuBars); abar=$(get Booter.Quirks.ResizeAppleGpuBars)
-# 13 = 8 GB: the full BAR of an 8 GB card, measured 10-07 on the RTX 5060 (NVRM moves BAR1 out of the console, display armed).
-[ "$bar" != 13 ] && { echo "CHANGE ResizeGpuBars: ${bar:-unset} -> 13 (8 GB BAR, full memory bandwidth)"; EDITS+=("UEFI.Quirks.ResizeGpuBars|-integer|13"); }
-[ "$abar" != -1 ] && { echo "CHANGE ResizeAppleGpuBars: ${abar:-unset} -> -1 (macOS sees the full BAR)"; EDITS+=("Booter.Quirks.ResizeAppleGpuBars|-integer|-1"); }
-# boot.efi stops with STOP 0x16 (no room in low memory for the kernel) on some boards even with a valid custom slide, and
-# the full BAR set above moves memory around. AllowRelocationBlock loads the kernel through a scratch block in the lower
-# 4 GB and is used only when no slide fits (OpenCore Configuration, Booter > Quirks); it needs ProvideCustomSlide and
-# AvoidRuntimeDefrag, so it is only turned on where both are on.
-if [ "$(get Booter.Quirks.ProvideCustomSlide)" = true ] && [ "$(get Booter.Quirks.AvoidRuntimeDefrag)" = true ] && [ "$(get Booter.Quirks.AllowRelocationBlock)" != true ]; then
-  echo "CHANGE AllowRelocationBlock: on (boot.efi can still place the kernel when low memory is full)"; EDITS+=("Booter.Quirks.AllowRelocationBlock|-bool|true")
-fi
+note "preserving this OpenCore config's GPU BAR and kernel-placement settings"
 # The installer runs on the firmware framebuffer (IONDRVSupport); once the driver is in, that framebuffer would take
 # display index 0 from NVRMFB, so the installed system excludes it (as on the tested RTX 5060 setup).
 NEEDBLOCK=0; bi=$(bidx)
@@ -1065,7 +1101,7 @@ NEEDBLOCK=0; bi=$(bidx)
 # that GPU on (no disable-gpu, no framebuffer properties) so the panel shows macOS through the firmware framebuffer.
 # Excluding IONDRVSupport there leaves the built-in screen dark (10-10: 86 of 184 scans had the panel on the Intel GPU).
 IGPU="PciRoot(0x0)/Pci(0x2,0x0)"; INTELPANEL=0
-# LC_ALL=C: ioreg prints raw bytes, and awk in a UTF-8 locale stops on them (measured on studio256)
+# LC_ALL=C: ioreg prints raw bytes, and awk in a UTF-8 locale stops on them
 if ioreg -r -c IOPCIDevice -l -w0 2>/dev/null | LC_ALL=C awk '/\+-o /{v=0;c=0} /"vendor-id" = <86800000>/{v=1} /"class-code" = <00000300>/{c=1} v&&c{f=1} END{exit !f}' \
    && ! has "DeviceProperties.Add.$IGPU.disable-gpu" && ! has "DeviceProperties.Add.$IGPU.AAPL,ig-platform-id"; then
   INTELPANEL=1; note "the built-in screen runs on the Intel GPU through the firmware framebuffer; IONDRVSupport stays on"
@@ -1106,7 +1142,26 @@ for k in boot-args csr-active-config; do echo "$del" | grep -q "<string>$k</stri
 # these machines when macOS is chosen in the same picker session, because the tool runs after OpenCore's delete.
 # Booter > Quirks > DisableVariableWrite (1401 1.14 sets it on Ryzen 7000/8000/9000 desktops, which froze 19 minutes into
 # the install) blocks every NVRAM write from macOS, so on those machines the flag is cleared by OpenCore from the start.
-if { nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 || [ "$(get Booter.Quirks.DisableVariableWrite)" = true ]; } \
+# Ryzen 7000/8000/9000 (Zen 4/5, AM5 and their laptops): 1401 1.14 turns DisableVariableWrite on for new EFIs, but 173 of
+# 175 Ryzen EFIs uploaded before it had it off, and those installs kept letting macOS write the firmware's NVRAM through a
+# rewritten memory map. On a TUF B650M a restart from macOS froze and the board needed an RMA (chat 10-12). Existing EFIs
+# get the same setting here, the moment the driver is installed or updated. It needs OpenRuntime.efi (it is the quirk's
+# host); without it nothing is changed and the reason is said. Pattern = 1401 policy.py _ZEN45_NAME.
+DVW_NEW=0
+CPUB=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+if printf '%s' "$CPUB" | grep -Eiq 'Ryzen AI([^A-Za-z0-9]|$)|Ryzen [3579] ([79][0-9][0-9]0(X3D|X|F)?|8[0-9][0-9]0[FG])([^A-Za-z0-9]|$)|Ryzen [3579] [78][0-9][45][0-9](HX3D|HX|HS|H|U)([^A-Za-z0-9]|$)' \
+   && [ "$(get Booter.Quirks.DisableVariableWrite)" != true ]; then
+  ort=0; i=0
+  while p=$(plutil -extract UEFI.Drivers.$i.Path raw -o - "$C" 2>/dev/null); do
+    [ "$p" = OpenRuntime.efi ] && [ "$(get UEFI.Drivers.$i.Enabled)" != false ] && ort=1; i=$((i+1)); done
+  if [ $ort = 1 ]; then
+    DVW_NEW=1; EDITS+=("Booter.Quirks.DisableVariableWrite|-bool|true")
+    echo "CHANGE Booter -> Quirks: DisableVariableWrite on ($CPUB: macOS NVRAM writes through the firmware froze AM5 boards)"
+  else
+    note "$CPUB: DisableVariableWrite should be on, but OpenRuntime.efi is not loaded - left as is; rebuild the EFI with 1401 1.14"
+  fi
+fi
+if { nvram 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove >/dev/null 2>&1 || [ "$(get Booter.Quirks.DisableVariableWrite)" = true ] || [ $DVW_NEW = 1 ]; } \
    && ! echo "$del" | grep -q "<string>nullmoth-remove</string>"; then
   DELADD+=("nullmoth-remove"); echo "CHANGE NVRAM Delete: add nullmoth-remove (a leftover remove flag this Mac cannot clear from macOS)"
 fi
@@ -1340,7 +1395,7 @@ SINCE=$(date -r "$(sysctl -n kern.boottime | sed -E 's/.*\{ sec = ([0-9]+),.*/\1
 capture "BEFORE restart"
 SINCE=$(date '+%Y-%m-%d %H:%M:%S')
 : > "$MARK"   # claim the single shot BEFORE touching WindowServer, so a respawn can never loop
-# Only ever at the login window. 1.9.0 (10-10): with auto-login the session already existed when this fired, so the
+# Only ever at the login window. In 1.9.0, with auto-login the session already existed when this fired, so the
 # restart logged the user out to the password screen. A restart under a logged-in user ends their session; never do it.
 CONSOLE=$(stat -f%Su /dev/console 2>/dev/null)
 if [ -n "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)" ]; then
@@ -1424,7 +1479,7 @@ while :; do
   cur="$(sysctl $CTRS 2>/dev/null | sed -E 's/^debug\.(nvaccel_|nvrmfb_)?//; s/: /=/' | tr '\n' ' ')$(hz)"
   if [ "$cur" != "$PREV" ] || [ $((i % 30)) = 0 ]; then echo "$(date -u +%H:%M:%S) ws=$w $cur" >> "$T"; PREV=$cur; fi
   i=$((i + 1))
-  # every second for the first 15 minutes after boot (the handoff and login), then every 5 s
+  # every second for the first 15 minutes after boot (display hand-over and login), then every 5 s
   if [ $(( $(date +%s) - BOOT )) -lt 900 ]; then sleep 1; else sleep 5; fi
   [ $((i % 300)) = 0 ] && { rot "$T"; for f in "$K" "$W"; do s=$(stat -f%z "$f" 2>/dev/null || echo 0); [ "$s" -gt $CAP ] && { cp "$f" "$f.1"; : > "$f"; }; done; }
 done
