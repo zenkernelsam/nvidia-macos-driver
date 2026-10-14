@@ -5,6 +5,10 @@
  */
 
 #include "../nvrm_off.h"
+#ifdef NMX_ACCEL
+// NMXAccel: this accelerator built for the AMD and Intel GPUs that NMXGPU drives (see nmx_accel_names.h)
+#include "nmx_accel_names.h"
+#endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -29,7 +33,12 @@ static bool               nvAccelCopyToScanout(IOAccelResource2 *res);
 void                      nvAccelSwapProbe(IOAccelResource2 *a1, IOAccelResource2 *a2);
 bool                      nvAccelResHasContent(IOAccelResource2 *res);
 static void               nvAccelWriteStamp(int index, unsigned int value);
-#define ALOG(fmt, ...) do { kprintf("NVAccel: " fmt "\n", ##__VA_ARGS__); IOLog("NVAccel: " fmt "\n", ##__VA_ARGS__); } while (0)
+#ifdef NMX_ACCEL
+#define NV_LOG_TAG "NMXAccel: "
+#else
+#define NV_LOG_TAG "NVAccel: "
+#endif
+#define ALOG(fmt, ...) do { kprintf(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); IOLog(NV_LOG_TAG fmt "\n", ##__VA_ARGS__); } while (0)
 #include <libkern/c++/OSSymbol.h>
 #include "nvrm_vram_abi.h"
 #include <IOKit/IODeviceMemory.h>
@@ -50,8 +59,13 @@ static int gNvAccelArmed = 0;
 // 1 once the headless check restored the plugin name without arming (no NVIDIA display head). The Metal plugin reads it:
 // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
 static int gNvHeadless = 0;
+#ifdef NMX_ACCEL
+SYSCTL_INT(_debug, OID_AUTO, nmxaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
+           "1 = AMD/Intel Metal device for apps; frames are copied to the framebuffer WindowServer draws");
+#else
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_headless, CTLFLAG_RD | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvHeadless, 0,
            "1 = no NVIDIA display: Metal device for apps only, WindowServer on the GPU that owns the display");
+#endif
 // 4 NVIDIA heads (nvfbheads=4) + 1 for an Intel built-in panel (NMIntelFB, IOFBDependentIndex 4): WindowServer composites
 // that panel on the NVIDIA card and the display-pipe copy path below writes each frame into the Intel scan-out surface.
 static const unsigned kNvMaxFB = 5;
@@ -59,13 +73,17 @@ static unsigned gNvHeadsPublished = 0, gNvHeadsRegistered = 0;
 static unsigned gNvHeadsPiped = 0;
 // The Intel built-in panel (head 4) joins only when this is 1. Off by default while the path is proven: a write at run
 // time (then debug.nvaccelfb=3 and a WindowServer restart) can be undone by a reboot, so a hang never needs hands
-// (10-10: the first virtual-panel test froze studio at boot and needed a power cycle).
+// (the first virtual-panel test froze the machine at boot and needed a power cycle).
 static int gNvIgpu = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_igpu, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gNvIgpu, 0,
            "1 = give an Intel built-in panel (NMIntelFB, head 4) a display pipe on this accelerator");
 
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d); extern "C" kern_return_t _stop(kmod_info_t *ki, void *d);
+#ifdef NMX_ACCEL
+extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NMXAccel, "0.1", _start, _stop) }
+#else
 extern "C" { KMOD_EXPLICIT_DECL(com.nullmoth.NVAccel, "0.1", _start, _stop) }
+#endif
 extern "C" kern_return_t _start(kmod_info_t *ki, void *d) { return KERN_SUCCESS; }
 extern "C" kern_return_t _stop(kmod_info_t *ki, void *d)  { return KERN_SUCCESS; }
 
@@ -349,7 +367,7 @@ public:
         for (unsigned i = 0; i < kNvMaxFB; i++) {
             IOService *fb = fFBs[i];
             if (!fb) {
-                // The Intel panel (index 4, NMIntelFB) does not wait for NVIDIA heads that never publish: studio with one
+                // The Intel panel (index 4, NMIntelFB) does not wait for NVIDIA heads that never publish: a machine with one
                 // monitor publishes only head 0, and the walk stopped there, so the Intel head got no pipe (measured 10-10,
                 // published 0x11 registered 0x1). Pipes are found by their framebuffer pointer, not their number.
                 if (gNvIgpu && i < 4 && ((gNvHeadsPublished >> 4) & 1)) { i = 3; continue; }
@@ -464,6 +482,11 @@ public:
                      (handler && *handler) ? (*handler)->getMetaClass()->getClassName() : "(none)"); }
             return fr;
         }
+#ifdef NMX_ACCEL
+        // NVIDIA RM clients are NVK's; RADV and ANV talk to NMXGPU's DRM device nodes instead
+        ALOG("newUserClient(0x%x): an NVIDIA RM client type on an AMD/Intel accelerator -- refused", type);
+        return kIOReturnUnsupported;
+#endif
 
         if (!fNVRM) {
             OSDictionary *m = serviceMatching("NVRM");
@@ -528,7 +551,11 @@ public:
         if (IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider)) {
             const unsigned cls = pci->configRead8(0x0B), sub = pci->configRead8(0x0A);
             const unsigned ven = pci->configRead16(0x00), dev = pci->configRead16(0x02);
+#ifdef NMX_ACCEL
+            if (cls != 0x03 || (ven != 0x1002 && ven != 0x8086)) {
+#else
             if (cls != 0x03 || (sub != 0x00 && sub != 0x02) || ven != 0x10de || dev < 0x0020) {
+#endif
                 ALOG("%04x:%04x class %02x.%02x is not an NVIDIA display device we support - not claiming",
                      ven, dev, cls, sub);
                 return NULL;
@@ -539,6 +566,21 @@ public:
     }
     virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
         { if (nvrm_driver_off()) return false; }
+#ifdef NMX_ACCEL
+        // NMXGPU decides which AMD/Intel GPUs are driven (nmxamd=1 / nmxintel=1 / nullmoth-gpu); this accelerator only
+        // starts on a device it has claimed, so a GPU macOS drives itself never gets a second accelerator
+        // No waiting here: NMXGPU attaches from a thread once the disks with its firmware are mounted, and mounting waits
+        // for matching to settle - a start() that blocked matching for the claim would hold the boot at the logo. NMXGPU
+        // re-runs matching on the device (registerService) after it sets nmxgpu-claimed, which offers it here again.
+        if (IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider)) {
+            if (pci->getProperty("nmxgpu-claimed") != kOSBooleanTrue) {
+                ALOG("NMXGPU has not claimed %04x:%04x yet - not starting now; offered again when it does",
+                     pci->configRead16(0x00), pci->configRead16(0x02));
+                return false;
+            }
+            ALOG("NMXGPU drives %04x:%04x - starting", pci->configRead16(0x00), pci->configRead16(0x02));
+        }
+#else
         uint32_t gate = 0;
         if (!PE_parse_boot_argn("nvaccel", &gate, sizeof gate) || !gate) { ALOG("boot-arg nvaccel=1 absent: NOT starting (boot-loop guard)"); return false; }
         if (IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider)) {
@@ -551,6 +593,7 @@ public:
             }
             ALOG("NVRM owns %04x:%04x (waited %u ms) - starting", pci->configRead16(0x00), pci->configRead16(0x02), waited * 100);
         }
+#endif
         ALOG("start(%s): calling IOGraphicsAccelerator2::start — the family's own bring-up", provider ? provider->getName() : "?");
         bool r = IOGraphicsAccelerator2::start(provider);
         ALOG("IOGraphicsAccelerator2::start -> %d", r);
@@ -574,7 +617,17 @@ public:
             fRegLock = IOLockAlloc();
             ALOG("multi-head: up to %u heads, registration lock %p%s", kNvMaxFB, fRegLock,
                  fRegLock ? "" : " -- NULL: two sysctl writers could interleave a registration");
+#ifdef NMX_ACCEL
+            // AMD/Intel: the Metal device is for apps; WindowServer draws into NMXGPU's framebuffer, and the plugin copies
+            // finished frames into the IOSurfaces it reads (the headless path NVIDIA laptops use)
+            nvaccelInstallSysctl();
+            gNvHeadless = 1;
+            setProperty("NMXAccelHeadless", kOSBooleanTrue);
+            ALOG("AMD/Intel accelerator up: Metal device for apps, frames copied to the framebuffer WindowServer draws");
+            OSDictionary *fbm = nullptr;
+#else
             OSDictionary *fbm = serviceMatching("NVRMNVDAFramebuffer");
+#endif
             if (fbm) {
                 fFBNote = addMatchingNotification(gIOFirstPublishNotification, fbm, &NVAccel::fbPublished, this, nullptr, 0);
                 fbm->release();
@@ -626,6 +679,16 @@ IOAccelMemory *NVDisplayPipe::initFramebufferResource(unsigned int index, IOAcce
     for (unsigned i = 0; i < sizeof r; i++) ((volatile unsigned char *)&r)[i] = 0;
     r.version = NVRM_VRAM_ABI_VERSION;
     IOReturn ret = a->askFramebufferForScanout(&r, fb);
+    if (ret == kIOReturnSuccess && r.kva && !r.phys) {
+        // Another GPU's panel (NMIntelFB on a laptop without a MUX): its scanout is Intel memory with a CPU mapping and
+        // no NVIDIA VRAM address. No vidmem may stand for it (addToAperture/getApertureMemoryDescriptor would hand
+        // BAR1 offset 0 to the GPU), and none may be allocated in its place (fresh VRAM mapped here is the 10-10
+        // os_map_kernel_space hang shape). NULL is the family's own default: frames reach this panel only through
+        // performTransaction's copy into kva (debug.nvaccel_iop_ok_h4 counts them).
+        ALOG("NVDisplayPipe::initFramebufferResource(head %u, index %u): CPU-only scanout %u x %u pitch %u (another GPU's "
+             "panel) -- no framebuffer resource, frames are copied", head, index, r.width, r.height, r.pitch);
+        return nullptr;
+    }
     if (ret != kIOReturnSuccess || !r.phys || !r.actualSize) {
         ALOG("NVDisplayPipe::initFramebufferResource: framebuffer would not describe its scanout (0x%x)", (unsigned)ret);
         return nullptr;
@@ -693,8 +756,11 @@ void *NVResource::getApertureMemoryDescriptor(unsigned long long *a0)
     return fApDesc;
 }
 
+static void nvSVForgetResource(NVResource *resource);
+
 void NVResource::free()
 {
+    nvSVForgetResource(this);
     if (fApDesc) { fApDesc->release(); fApDesc = nullptr; }
     OSAddAtomic64(1, &gCntResFree);
     IOAccelResource2::free();
@@ -825,6 +891,7 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 }
 
 static void nvAccelSurfScanoutSync(IOSurface *s);
+static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
@@ -867,7 +934,11 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
         return kIOReturnSuccess;
     } else if (s) {
-        nvAccelSurfScanoutSync(s);
+        // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
+        // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
+        // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
+        // Such a frame now keeps the previous picture on the panel instead.
+        if (!nvAccelSurfCopyReady(s, head)) return kIOReturnSuccess;
         const unsigned fmt = s->getPixelFormat();
         if (fmt != 0x42475241u) NVIOP_FAIL(kIOReturnUnsupported, "surface 0x%x format 0x%08x is not BGRA", s->getSurfaceID(), fmt);
         const unsigned long long W = s->getWidth(), H = s->getHeight(), P = s->getBytesPerRow();
@@ -985,6 +1056,8 @@ NVACCEL_CNT(nvaccel_iop_empty,        gCntIopEmpty,       "K3: transactions with
 NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced from our VRAM resource");
 NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
 NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+static SInt64 gCntIopCopySkip;
+NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
 static int    gIopFlip = 0;
 static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_flip, CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_KERN, &gIopFlip, 0, "1 = scan the composited IOSurface out of its own VRAM (no copy)");
@@ -1012,6 +1085,11 @@ static bool gSysctlInstalled = false;
 static void nvaccelInstallSysctl(void)
 {
     if (gSysctlInstalled) return;
+#ifdef NMX_ACCEL
+    // only this one: the NVIDIA accelerator may be loaded too, and owns the debug.nvaccel* names
+    sysctl_register_oid(&sysctl__debug_nmxaccel_headless);
+    gSysctlInstalled = true;
+#else
     sysctl_register_oid(&sysctl__debug_nvaccelfb);
     sysctl_register_oid(&sysctl__debug_nvaccel_headless);
     sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc);       sysctl_register_oid(&sysctl__debug_nvaccel_vm_alloc_bytes);
@@ -1024,7 +1102,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
@@ -1040,6 +1118,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
+#endif
 }
 
 static inline void nvAccelZero(void *p, unsigned long n)
@@ -1146,21 +1225,39 @@ static void nvFamUnlock(NVAccel *a)
 static unsigned gNVSVLockMiss;
 enum { kNVSVPend = 512 };
 static unsigned gNVSVPendId[kNVSVPend];
+static NVResource *gNVSVPendResource[kNVSVPend];
 static IOSimpleLock *gNVSVPendLock;
-static bool nvSVPend(unsigned id, int op)
+static bool nvSVPend(unsigned id, int op, NVResource *resource = nullptr)
 {
     if (!id) return op == 1 ? false : false;
     if (!gNVSVPendLock) return op == 1 ? false : false;
     bool r = false; int freeSlot = -1;
     IOSimpleLockLock(gNVSVPendLock);
     for (int i = 0; i < kNVSVPend; i++) {
-        if (gNVSVPendId[i] == id) { r = true; if (op == 0) gNVSVPendId[i] = 0; break; }
+        if (gNVSVPendId[i] == id) {
+            r = true;
+            if (op == 0) { gNVSVPendId[i] = 0; gNVSVPendResource[i] = nullptr; }
+            else if (op == 1) gNVSVPendResource[i] = resource;
+            break;
+        }
         if (!gNVSVPendId[i] && freeSlot < 0) freeSlot = i;
     }
-    if (op == 1 && !r) { if (freeSlot >= 0) { gNVSVPendId[freeSlot] = id; r = true; } }
+    if (op == 1 && !r) { if (freeSlot >= 0) { gNVSVPendId[freeSlot] = id; gNVSVPendResource[freeSlot] = resource; r = true; } }
     else if (op == 1) r = true;
     IOSimpleLockUnlock(gNVSVPendLock);
     return r;
+}
+// A pending mark belongs to the resource that last dirtied the surface. Never
+// dereference a device cache during destruction, or clear a newer owner's mark.
+static void nvSVForgetResource(NVResource *resource)
+{
+    if (!resource || !gNVSVPendLock) return;
+    IOSimpleLockLock(gNVSVPendLock);
+    for (unsigned i = 0; i < kNVSVPend; i++) if (gNVSVPendResource[i] == resource) {
+        gNVSVPendId[i] = 0;
+        gNVSVPendResource[i] = nullptr;
+    }
+    IOSimpleLockUnlock(gNVSVPendLock);
 }
 static void    *gNVSVRoot;
 static unsigned gNVSVOk, gNVSVRefused;
@@ -1175,7 +1272,7 @@ static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
     volatile unsigned short *valid = *(unsigned short *volatile *)(r + 0x30);
     if (type != 0xc0 || (fl & 0x8000) || !valid || plane > 15) return NVRM_SS_NO_CACHE;
     if (!gNVSVPendLock) gNVSVPendLock = IOSimpleLockAlloc();
-    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1)) return NVRM_SS_NO_CACHE;
+    if (!nvSVPend(_ZNK9IOSurface12getSurfaceIDEv(*(void *volatile *)((unsigned char *)cache + 0x10)), 1, res)) return NVRM_SS_NO_CACHE;
     _ZN20IOSurfaceDeviceCache10setCurrentEv(cache);
     valid[6] |= (unsigned short)(1u << plane);
     valid[0] &= (unsigned short)~(1u << plane);
@@ -1558,6 +1655,38 @@ static void nvAccelSurfScanoutSync(IOSurface *s)
     if (!out) nvSVPend(_ZNK9IOSurface12getSurfaceIDEv((void *)s), 0);
     if (cache) ((OSObject *)cache)->release();
     nvFamUnlock(a);
+}
+// True when the surface's system memory holds its newest pixels, after moving them there if the GPU drew them into VRAM.
+// Unlike nvAccelSurfScanoutSync it waits a few ms for the accelerator lock and does not clear the pending mark when the
+// page-off fails. At most 4 frames in a row are held back per head: a surface that never syncs is copied as before
+// rather than freezing the panel.
+static unsigned gIopCopyHeld[kNvMaxFB];
+static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head)
+{
+    NVAccel *a = NVAccel::gAccel;
+    if (!s || !a) return true;
+    const unsigned id = _ZNK9IOSurface12getSurfaceIDEv((void *)s);
+    bool ready = !nvSVPend(id, 2);
+    if (!ready) {
+        bool locked = false;
+        for (unsigned i = 0; i < 8 && !(locked = nvFamLock(a, true)); i++) IOSleep(1);
+        if (locked) {
+            void *cache = _ZN22IOGraphicsAccelerator223deviceCacheForIOSurfaceEP9IOSurfacej((void *)a, (void *)s, 0);
+            OSObject *ctx = cache ? *(OSObject *volatile *)((unsigned char *)cache + 0x20) : nullptr;
+            NVResource *res = OSDynamicCast(NVResource, ctx);
+            volatile unsigned short *valid = res ? *(unsigned short *volatile *)((volatile unsigned char *)res + 0x30) : nullptr;
+            if (!res || !valid || (valid[0] & 1u)) ready = true;
+            else { bool out = false; res->pageoff(nullptr, true, &out, 0); ready = out || (valid[0] & 1u); }
+            if (ready) nvSVPend(id, 0);
+            if (cache) ((OSObject *)cache)->release();
+            nvFamUnlock(a);
+        }
+    }
+    if (head >= kNvMaxFB) return true;
+    if (ready) { gIopCopyHeld[head] = 0; return true; }
+    if (++gIopCopyHeld[head] > 4) { gIopCopyHeld[head] = 0; return true; }
+    OSAddAtomic64(1, &gCntIopCopySkip);
+    return false;
 }
 
 static unsigned nvVaAllocLogged, nvVaMapLogged;

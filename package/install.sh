@@ -23,6 +23,7 @@ release_install_lock() {
       echo "   NOTE: installer guard identity changed; its current path is retained for review." >&2
       return
     fi
+    rm -f "$LOCKDIR/owner" "$LOCKDIR/installing"
     rmdir "$LOCKDIR" || echo "   NOTE: installer lock could not be released; review it before another install." >&2
     LOCK_HELD=0
   elif [ "$LOCK_HELD" = 1 ]; then
@@ -51,11 +52,44 @@ rollback_install() {
   return "$failed"
 }
 step() { echo; echo "== $*"; }; ok() { echo "   ok  $*"; }
+boot_sec() { sysctl -n kern.boottime 2>/dev/null | sed -E 's/.*sec = ([0-9]+),.*/\1/'; }
+# kern.boottime is derived from the clock and moves when the clock is corrected after boot, so "the same boot" allows
+# 60 s of drift (review: an exact match could take a live install for a dead one and roll its files back mid-install).
+same_boot() { local a=$1 b; b=$(boot_sec); [ -n "$a" ] && [ -n "$b" ] && [ $((a > b ? a - b : b - a)) -le 60 ]; }
+# the pid is still the installer (pid numbers are reused): its command line names this script
+is_installer_pid() { ps -o command= -p "$1" 2>/dev/null | grep -Eq '(nullmoth-install|/install)\.sh'; }
+# A guard left by an install that was killed outright (power loss, a forced quit, a restart mid-install) stopped every
+# later install with "installer guard already exists" until someone removed it by hand (3 reports and chat, 10-12).
+# The guard now records its owner (pid, boot) and, once files start changing, the backup it can be restored from.
+# A guard whose owner is gone is recovered: rolled back from that backup if it had started changing files, then cleared.
+# A live install, or one whose own restore failed (restore-incomplete), still stops.
+recover_stale_guard() {
+  local g=$LOCKDIR o=$LOCKDIR/owner pid="" boot="" bk=""
+  [ -d "$g" ] && [ ! -L "$g" ] && [ "$(stat -f '%u' "$g" 2>/dev/null)" = 0 ] || return 0
+  [ ! -e "$g/restore-incomplete" ] || die "the last install could not restore the previous driver (its backup is kept in /Library/NullMoth); use Remove NVIDIA driver, then install again, or send logs (no driver changes made)"
+  if [ -f "$o" ] && [ ! -L "$o" ]; then
+    pid=$(sed -n 's/^pid=\([0-9][0-9]*\)$/\1/p' "$o" | head -1); boot=$(sed -n 's/^boot=\([0-9][0-9]*\)$/\1/p' "$o" | head -1)
+    bk=$(sed -n 's/^bk=\(.*\)$/\1/p' "$o" | head -1)
+    if [ -n "$pid" ] && same_boot "$boot" && kill -0 "$pid" 2>/dev/null && is_installer_pid "$pid"; then return 0; fi
+  else
+    # a guard from 1.14.7 or earlier has no owner record: an install cannot outlive a restart, so one older than this boot is stale
+    [ "$(stat -f '%m' "$g" 2>/dev/null || echo 0)" -lt $(( $(boot_sec) - 60 )) ] || return 0
+  fi
+  echo "   NOTE: an earlier install was interrupted and left its guard behind; recovering it"
+  if [ -e "$g/installing" ]; then
+    case "$bk" in /Library/NullMoth/backup-*) ;; *) die "an interrupted install had changed driver files and its backup is not recorded; use Remove NVIDIA driver, then install again (no driver changes made)";; esac
+    [ -d "$bk" ] && [ ! -L "$bk" ] || die "the interrupted install's backup $bk is missing; use Remove NVIDIA driver, then install again (no driver changes made)"
+    BK=$bk
+    if ! rollback_install; then : > "$g/restore-incomplete"; die "restoring the interrupted install failed; its backup is kept at $bk"; fi
+    echo "   ok  the interrupted install was rolled back from $bk"; BK=""
+  fi
+  rm -f "$o" "$g/installing"; rmdir "$g" 2>/dev/null || die "could not clear the interrupted install's guard"
+}
 die() {
   echo "   STOP: $*" >&2
   if [ "$INSTALLING" = 1 ]; then
     if rollback_install; then echo "   Previous installation restored; backup retained at $BK." >&2
-    else LOCK_RELEASE_OK=0; echo "   Restore incomplete; recovery files remain at $BK." >&2; fi
+    else LOCK_RELEASE_OK=0; : > "$LOCKDIR/restore-incomplete" 2>/dev/null; echo "   Restore incomplete; recovery files remain at $BK." >&2; fi
   fi
   exit 1
 }
@@ -95,7 +129,8 @@ ioreg -r -c IOPCIDevice -d 1 | grep -q '"vendor-id" = <de100000>' || die "no NVI
 SUPPORTED_IDS="
 1E02 1E04 1E07 1E30 1E36 1E78 1E81 1E82 1E84 1E87 1E89 1E90 1E91 1E93 1EB0 1EB1 1EB5 1EB6 1EC2 1EC7 1ED0 1ED1 1ED3
 1EF5 1F02 1F03 1F06 1F07 1F08 1F0A 1F10 1F11 1F12 1F14 1F15 1F36 1F42 1F47 1F50 1F51 1F54 1F55 1F76 1F82 1F83 1F91
-1F95 1F96 1F97 1F98 1F99 1F9C 1F9D 1F9F 1FA0 1FB8 1FB9 1FDD 1FF9 2182 2184 2187 2188 2191 2192 21C4 21D1 2203 2204
+1F95 1F96 1F97 1F98 1F99 1F9C 1F9D 1F9F 1FA0 1FB0 1FB1 1FB2 1FB6 1FB7 1FB8 1FB9 1FBA 1FBB 1FBC 1FDD 1FF0 1FF2 1FF9
+2182 2184 2187 2188 2191 2192 21C4 21D1 2203 2204
 2206 2207 2208 220A 2216 2230 2231 2232 2233 2414 2420 2438 2460 2482 2484 2486 2487 2488 2489 249C 249D 24A0 24B0
 24B1 24B6 24B7 24B8 24B9 24BA 24BB 24C7 24C9 24DC 24DD 24E0 24FA 2503 2504 2507 2508 2520 2521 2523 2531 2544 2560
 2563 2571 2582 2584 25A0 25A2 25A5 25A6 25A7 25A9 25AA 25AB 25AC 25AD 25B0 25B2 25B8 25B9 25BA 25BB 25BC 25BD 25E0
@@ -108,6 +143,9 @@ SUPPORTED_IDS="
 NV_IDS=$(ioreg -r -c IOPCIDevice -d 1 | awk '/"vendor-id" = <de100000>/{nv=1} /"device-id" = </{ if (match($0, /<[0-9a-f]+>/)) d=substr($0, RSTART+1, 4) }
   /^\+-o|^ *\}/{ if (nv && d != "") print toupper(substr(d,3,2) substr(d,1,2)); nv=0; d="" }' | sort -u)
 CARD=""; for i in $NV_IDS; do case " $(echo $SUPPORTED_IDS) " in *" $i "*) CARD=$i;; esac; done
+# Every device id from 1E00 up is Turing or newer (TU102 is 1E02; Volta and older sit below it), which RM drives through GSP.
+# The list above names the GeForce/RTX ids measured so far; a Quadro T1200 laptop (1FBC) was refused as "older".
+[ -n "$CARD" ] || for i in $NV_IDS; do case $i in *[!0-9A-F]*|"") ;; *) [ $((16#$i)) -ge $((16#1E00)) ] && CARD=$i;; esac; done
 [ -n "$CARD" ] || die "this NVIDIA card (device $(echo $NV_IDS)) is older than the driver supports (RTX 20 / Turing and newer); macOS keeps running on it in basic display, with no changes made"
 ok "macOS $v, x86_64, NVIDIA GPU present"
 
@@ -145,8 +183,12 @@ if [ "${CHECK:-0}" != 1 ]; then
     mkdir -m 755 /Library/NullMoth || die "create installer state directory"
   fi
   require_install_directory /Library/NullMoth
-  mkdir -m 700 "$LOCKDIR" 2>/dev/null || die "installer guard already exists; another install is active or an interrupted guard needs review (no driver changes made)"
+  if ! mkdir -m 700 "$LOCKDIR" 2>/dev/null; then
+    recover_stale_guard
+    mkdir -m 700 "$LOCKDIR" 2>/dev/null || die "installer guard already exists; another install is active right now (no driver changes made)"
+  fi
   LOCK_HELD=1
+  printf 'pid=%s\nboot=%s\n' "$$" "$(boot_sec)" > "$LOCKDIR/owner" || die "cannot record the installer guard's owner"
   LOCK_ID=$(stat -f '%d:%i' "$LOCKDIR" 2>/dev/null) || die "cannot record installer guard identity"
   printf '%s\n' "$LOCK_ID" | grep -Eq '^[0-9]+:[0-9]+$' || die "installer guard identity is unavailable"
 fi
@@ -165,6 +207,7 @@ ok "test collection holds all four kexts"
 [ "${CHECK:-0}" = 1 ] && { rm -rf "$T"; echo; echo "CHECK PASS (nothing changed)"; exit 0; }
 
 BK=$(mktemp -d "/Library/NullMoth/backup-$(date +%Y%m%d-%H%M%S).XXXXXX") && [ -n "$BK" ] && [ -d "$BK" ] || die "create unique backup directory"
+[ "${CHECK:-0}" = 1 ] || printf 'bk=%s\n' "$BK" >> "$LOCKDIR/owner" || die "cannot record the backup in the installer guard"
 step "4. back up what is there now -> $BK"
 printf '%s\n' "$BUILD" > "$BK/macos-build" || die "record backup macOS build"
 # ditto, not cp -Rp: cp re-applies file flags through symlinks and stopped on nvmtl/libvulkan.dylib with "chflags: Too
@@ -178,19 +221,67 @@ for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do [ ! -e
 ok "backup written"
 
 step "5. install"
-INSTALLING=1
+INSTALLING=1; [ "${CHECK:-0}" = 1 ] || : > "$LOCKDIR/installing"
 for k in $KEXTS; do rm -rf "$EXT/$k.kext" && ditto "$(kpath $k)" "$EXT/$k.kext" || die "copy $k (restore from $BK)"; done
 # both NVAccel builds stay on disk, so the first start after a macOS upgrade can switch to the matching one
 mkdir -p /Library/NullMoth && rm -rf /Library/NullMoth/kexts && ditto "$HERE/Library/NullMoth/kexts" /Library/NullMoth/kexts || die "copy per-macOS accelerators (restore from $BK)"
+# the AMD/Intel Vulkan drivers under the Metal plugin (RADV, ANV, libdrm), cached for setup --gpu-test like NMXGPU
+if [ -d "$HERE/Library/NullMoth/gpu-userland" ]; then
+  rm -rf /Library/NullMoth/gpu-userland && ditto "$HERE/Library/NullMoth/gpu-userland" /Library/NullMoth/gpu-userland || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
+fi
+# the NPU userland (Level Zero + Intel's NPU driver and compiler, OpenVINO, AMD's XRT), loaded from /Library/NullMoth/npu
+# by apps. AMD's validation archives in xrt/share/amdxdna/bins were fetched by setup for this Mac's NPU and are not in
+# the package, so they are carried over the replacement.
+if [ -d "$HERE/Library/NullMoth/npu" ]; then
+  NPUKEEP=""
+  if [ -d /Library/NullMoth/npu/xrt/share/amdxdna/bins ]; then
+    NPUKEEP=$(mktemp -d /private/var/tmp/nullmoth-npu-bins.XXXXXX) && ditto /Library/NullMoth/npu/xrt/share/amdxdna/bins "$NPUKEEP" \
+      || die "keep the NPU validation archives (restore from $BK)"
+  fi
+  rm -rf /Library/NullMoth/npu && ditto "$HERE/Library/NullMoth/npu" /Library/NullMoth/npu && chmod -R go-w,a+rX /Library/NullMoth/npu \
+    || die "copy the NPU userland (restore from $BK)"
+  if [ -n "$NPUKEEP" ]; then
+    mkdir -p /Library/NullMoth/npu/xrt/share/amdxdna && ditto "$NPUKEEP" /Library/NullMoth/npu/xrt/share/amdxdna/bins \
+      && chmod -R go-w,a+rX /Library/NullMoth/npu/xrt/share/amdxdna/bins && rm -rf "$NPUKEEP" \
+      || die "restore the NPU validation archives from $NPUKEEP"
+  fi
+fi
 for target in 15 26; do
   dir=/Library/NullMoth/kexts/$target
   [ -f "$dir/NVAccel.kext/Contents/MacOS/NVAccel" ] && [ -f "$dir/NVAccel.kext/Contents/Info.plist" ] || die "missing macOS $target accelerator (restore from $BK)"
   (cd "$dir" && find NVAccel.kext -type f -exec shasum -a 256 '{}' \;) > "$dir/SHA256SUMS" || die "cache manifest for macOS $target"
 done
 chown -R root:wheel /Library/NullMoth/kexts && chmod -R go-w /Library/NullMoth/kexts || die "cached accelerator permissions"
+# the AMD/Intel GPU driver (opt-in, setup --gpu-test): when it is on, an update brings its new build along
+if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/kexts/15/NMXGPU.kext ]; then
+  rm -rf "$EXT/NMXGPU.kext" && ditto /Library/NullMoth/kexts/15/NMXGPU.kext "$EXT/NMXGPU.kext" && chown -R root:wheel "$EXT/NMXGPU.kext" \
+    && chmod -R 755 "$EXT/NMXGPU.kext" || die "refresh the AMD/Intel GPU driver (restore from $BK)"
+  # and its Metal accelerator
+  if [ -d /Library/NullMoth/kexts/15/NMXAccel.kext ]; then
+    rm -rf "$EXT/NMXAccel.kext" && ditto /Library/NullMoth/kexts/15/NMXAccel.kext "$EXT/NMXAccel.kext" && chown -R root:wheel "$EXT/NMXAccel.kext" \
+      && chmod -R 755 "$EXT/NMXAccel.kext" || die "refresh the AMD/Intel Metal accelerator (restore from $BK)"
+  fi
+  # and the NPU driver, where it was turned on
+  if [ -d "$EXT/NMXNPU.kext" ] && [ -d /Library/NullMoth/kexts/15/NMXNPU.kext ]; then
+    rm -rf "$EXT/NMXNPU.kext" && ditto /Library/NullMoth/kexts/15/NMXNPU.kext "$EXT/NMXNPU.kext" && chown -R root:wheel "$EXT/NMXNPU.kext" \
+      && chmod -R 755 "$EXT/NMXNPU.kext" || die "refresh the NPU driver (restore from $BK)"
+  fi
+fi
 echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
 mkdir -p "$GB" "$FW" || die "create bundle and firmware directories"
+# $GB/nvmtl is replaced wholesale below, so move the shared shader caches aside first. NVMTLLibraryLoad.m
+# reads them from NVMTL_AIRCACHE_DIR (/Library/GPUBundles/nvmtl/aircache) and uses that path whenever it is
+# writable, which is what lets every process - WindowServer included - share one persistent cache instead of
+# compiling into a private one that a reboot or a temp sweep throws away.
+CACHEKEPT=""
+for c in aircache spvcache; do
+  [ ! -d "$GB/nvmtl/$c" ] || { mv "$GB/nvmtl/$c" "$T/keep-$c" && CACHEKEPT="$CACHEKEPT $c" || die "stash $GB/nvmtl/$c"; }
+done
 for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "copy $b (restore from $BK)"; done
+# nvmtl was just replaced wholesale: with the AMD/Intel driver on, its Vulkan drivers go back in beside NVK
+if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/gpu-userland ]; then
+  ditto /Library/NullMoth/gpu-userland "$GB/nvmtl" || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
+fi
 cp "$HERE/Library/GPUBundles/nvmtl-allow.txt" "$GB/" || die "copy bundle allow list"
 ditto "$HERE/Users/Shared/nvfw" "$FW" || die "copy firmware"
 for k in $KEXTS; do chown -R root:wheel "$EXT/$k.kext" && chmod -R 755 "$EXT/$k.kext" || die "permissions for $k"; done
@@ -200,6 +291,25 @@ chown -R root:wheel "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmt
 # ("Failed to create MetalDevice") on every start: the crash loop after install on many machines.
 chmod -R go-w,a+rX "$GB/NVMTLDriver.bundle" "$GB/NVIDIAShared.bundle" "$GB/nvmtl" && chmod 644 "$GB/nvmtl-allow.txt" || die "bundle permissions"
 sudo -u _windowserver /bin/test -r "$GB/nvmtl-allow.txt" || die "WindowServer cannot read $GB/nvmtl-allow.txt (restore from $BK)"
+# Create the shared shader caches the plugin looks for. Without them NVMTL_AIRCACHE_DIR never resolves, so
+# WindowServer, which compiles the compositor's pipelines on demand, re-translates them from scratch at every start
+# and its content renders black until the translation finishes (community patch #19; ownership below).
+# NOTE: this must stay AFTER the "chmod -R go-w ... $GB/nvmtl" above. That recursive chmod would otherwise
+# strip the write bits back off aircache/spvcache and the shared cache would silently stop working.
+mkdir -p "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "create the shared shader caches"
+# Owned by WindowServer (_windowserver), writable by nobody else: WindowServer loads what is in these caches as
+# compiled shaders, so a cache any user can write (1777, as first proposed) would let a local user plant code into
+# WindowServer. Other processes see the folders read-only and keep their own private caches, which the plugin already
+# does when NVMTL_AIRCACHE_DIR is not writable. A cache kept from an earlier install is reused only if nobody but
+# _windowserver could have written into it; otherwise it starts empty.
+for c in $CACHEKEPT; do
+  [ -d "$T/keep-$c" ] || continue
+  if [ -z "$(find "$T/keep-$c" \( ! -user _windowserver -o -perm -o+w -o -perm -g+w \) -print -quit 2>/dev/null)" ]; then
+    rm -rf "$GB/nvmtl/$c" && mv "$T/keep-$c" "$GB/nvmtl/$c" || die "restore $GB/nvmtl/$c"
+  else rm -rf "$T/keep-$c"; echo "   note: $c was writable by other users; starting it empty"; fi
+done
+chown -R _windowserver:wheel "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "shader cache owner"
+chmod 0755 "$GB/nvmtl/aircache" "$GB/nvmtl/spvcache" || die "shared shader cache permissions"
 NEWKC="$KC.nullmoth-install-new"; rm -f "$NEWKC"
 kmutil create -n aux --volume-root / ${KARG[@]+"${KARG[@]}"} -B $KB -S $KS --repository "$EXT" -A "$NEWKC" -z >"$T/kmutil2.log" 2>&1 || die "live kernel collection build failed (restore from $BK)"
 [ -s "$NEWKC" ] || die "live kernel collection build produced no output (restore from $BK)"

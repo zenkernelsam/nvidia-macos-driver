@@ -38,6 +38,8 @@ static inline FILE *nvmtl_rel_fopen(const char *p, const char *m) { return nvmtl
 #define fopen(p, m) nvmtl_rel_fopen(p, m)
 #endif
 int nvmtl_vk_init(void);
+uint16_t nvmtl_vk_set_accelerator(mach_port_t accelerator);
+uint16_t nvmtl_vk_vendor(void);
 const char *nvmtl_vk_device_name(void);
 void nvmtl_vk_counts(uint64_t *bm, uint64_t *bg, uint64_t *im, uint64_t *ig, size_t *bytes);
 void nvmtl_vk_cmd_counts(uint64_t *begun, uint64_t *submitted, uint64_t *abandoned);
@@ -291,6 +293,21 @@ static void nvmtl_nvenc_hevc_register(void)
               st ? "NOT registered" : "REGISTERED", me, (int)st, path);
     });
 }
+// ANGLE refuses Metal on NVIDIA (disableMetalOnNvidia), and Chromium on macOS has no other GL backend, so without this
+// the GPU process exits at start-up and Chrome, Edge and Electron apps draw everything on the CPU. 1.14.6 made this
+// opt-in after partial-redraw corruption on Ampere and Blackwell; that corruption was stale surface content, fixed in
+// 1.15. NVMTL_ANGLE_METAL=0 turns it off. An existing override is kept; no sandbox setting is changed.
+__attribute__((constructor)) static void nvmtl_angle_allow_nvidia(void)
+{
+    const char *opt = getenv("NVMTL_ANGLE_METAL");
+    if (opt && !strcmp(opt, "0")) return;
+    const char *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *rule = "disableMetalOnNvidia";
+    const char *cur = getenv(key);
+    if (cur && strstr(cur, rule)) return;
+    char v[1024];
+    if (cur && *cur) snprintf(v, sizeof v, "%s:%s", cur, rule); else snprintf(v, sizeof v, "%s", rule);
+    setenv(key, v, 1);
+}
 static bool nvmtl_process_is_allowed(void)
 {
     const char *me = getprogname();
@@ -299,7 +316,8 @@ static bool nvmtl_process_is_allowed(void)
     // on the GPU that owns the display, as on Apple's two-GPU Macs. The list below cannot express this: "*" matches
     // WindowServer before its "!WindowServer" line is reached.
     { int hv = 0; size_t hn = sizeof hv;
-      if (!strcmp(me, "WindowServer") && sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv) {
+      if (!strcmp(me, "WindowServer") && (nvmtl_vk_vendor() != 0x10de ||
+                                          (sysctlbyname("debug.nvaccel_headless", &hv, &hn, NULL, 0) == 0 && hv))) {
           nvlog("  headless GPU: no device for WindowServer (it composites on the GPU that owns the display)"); return false; } }
     if (getenv("NVMTL_ENABLE")) return true;
     if (!strcmp(me, "mtlprobe") || !strcmp(me, "nvmtltest") || !strcmp(me, "nvmtlrender")) return true;
@@ -365,6 +383,12 @@ static void nvmtl_install_hw_resource_pools(id dev)
     nvlog("-[NVMTLDevice initWithAcceleratorPort:%u] in %s", port, getprogname());
     self = [super initWithAcceleratorPort:port];
     if (!self) { nvlog("  super initWithAcceleratorPort: returned nil"); return nil; }
+    {   /* one GPU per process: the plugin runs a single Vulkan device, so a second Metal device on another vendor's
+           accelerator (a PC with an NVIDIA card and an AMD or Intel GPU) is refused rather than given the wrong GPU */
+        uint16_t mine = nvmtl_vk_set_accelerator(port), live = nvmtl_vk_vendor();
+        if (mine && mine != live) { nvlog("  accelerator vendor %04x, but this process runs Metal on %04x: no second device", mine, live); return nil; }
+        nvlog("  GPU vendor %04x (%s)", live, live == 0x1002 ? "AMD, RADV" : live == 0x8086 ? "Intel, ANV" : "NVIDIA, NVK");
+    }
     if (!nvmtl_process_is_allowed()) { nvlog("  not allow-listed: no device for %s", getprogname()); return nil; }
     nvlog("MTLIOAccelDevice's initWithAcceleratorPort: -> %p", (__bridge void *)self);
     gNVMTLMainDevice = self;
@@ -374,10 +398,12 @@ static void nvmtl_install_hw_resource_pools(id dev)
         nvlog("  NVK did not come up in this process - refusing to be the Metal device for %s", getprogname());
         return nil;
     }
-    nvmtl_nvdec_register();
-    nvmtl_nvenc_register();
-    nvmtl_nvdec_hevc_register();
-    nvmtl_nvenc_hevc_register();
+    if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
+        nvmtl_nvdec_register();
+        nvmtl_nvenc_register();
+        nvmtl_nvdec_hevc_register();
+        nvmtl_nvenc_hevc_register();
+    }
     SEL il = sel_registerName("initLimits");
     if ([self respondsToSelector:il]) {
         ((void (*)(id, SEL))objc_msgSend)(self, il);
@@ -413,8 +439,9 @@ static void nvmtl_install_hw_resource_pools(id dev)
 - (NSString *)vendorName {
     static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet new]; });
     Dl_info i = {0}; const char *who = dladdr(__builtin_return_address(0), &i) && i.dli_fname ? i.dli_fname : "?";
-    @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> NVIDIA (asked by %s)", who); } }
-    return @"NVIDIA";
+    NSString *v = nvmtl_vk_vendor() == 0x1002 ? @"AMD" : nvmtl_vk_vendor() == 0x8086 ? @"Intel" : @"NVIDIA";
+    @synchronized(seen) { NSString *k = @(who); if (![seen containsObject:k]) { [seen addObject:k]; nvlog("vendorName -> %s (asked by %s)", v.UTF8String, who); } }
+    return v;
 }
 - (NSString *)name {
     static int vk = 0; if (!vk) { vk = 1; nvmtl_vk_init(); }
@@ -656,6 +683,7 @@ static BOOL nvmtl_desc_fbo(MTLTextureDescriptor *d) {
     t->_usage = d.usage;
     if (wantStex && !t->_stex) { static unsigned long lost; lost++;
         if (!(lost & (lost - 1))) nvlog("newTextureWithDescriptor: pixel format %lu asked for ShaderWrite and NVK cannot make it a storage image — shader writes to it will be LOST (%lu texture(s) so far in this process)", (unsigned long)d.pixelFormat, lost); }
+    nvmtl_texture_desc_swizzle(t, d);
     nvlog("newTextureWithDescriptor: %lux%lu%s -> %p", (unsigned long)d.width, (unsigned long)d.height, t->_stex ? " +storage" : "", (__bridge void *)t); return t; }
 
 typedef struct { uint32_t magic, seed, gen; } nvmtl_vram_tag;
@@ -721,7 +749,16 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     return nvmtl_vk_image_create_typed(w, h, vkf, bpp, a8, 1, stex, 2u, 1u, &t->_i);
 }
 
+static char nvmtl_surface_cache_key;
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d iosurface:(IOSurfaceRef)surf plane:(NSUInteger)plane {
+    @synchronized(self) {
+        NSMapTable *cache = objc_getAssociatedObject(self, &nvmtl_surface_cache_key);
+        if (!cache) { cache = [NSMapTable strongToWeakObjectsMapTable];
+            objc_setAssociatedObject(self, &nvmtl_surface_cache_key, cache, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+        return [self nvmtlNewSurfaceTexture:d surface:surf plane:plane cache:cache];
+    }
+}
+- (id<MTLTexture>)nvmtlNewSurfaceTexture:(MTLTextureDescriptor *)d surface:(IOSurfaceRef)surf plane:(NSUInteger)plane cache:(NSMapTable *)cache {
     if (nvmtl_vk_init()) return nil;
     size_t w = d.width, h = d.height;
     if (!w || !h || w > UINT32_MAX || h > UINT32_MAX) return nil;
@@ -733,6 +770,19 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     uint32_t vkf = 0, bpp = 0; int a8 = 0;
     if (nvmtl_pixfmt(d.pixelFormat, &vkf, &bpp, &a8)) return nil;
     int wantStex = (d.usage & MTLTextureUsageShaderWrite) != 0;
+    NSArray *key = surf ? @[@(IOSurfaceGetID(surf)), @(plane), @(w), @(h), @(d.pixelFormat), @(wantStex), @(t->_ropt), @(t->_fbo)] : nil;
+    NVMTLTexture *backing = key ? [cache objectForKey:key] : nil;
+    // Failed BAR imports use a private image. Repeated wrappers of the same
+    // surface must share that image, just as successful family imports do.
+    // Weak entries do not pin the image after the application's last wrapper.
+    if (backing && !backing->_vramOn) {
+        NVMTLTexture *alias = (NVMTLTexture *)[backing newTextureViewWithPixelFormat:d.pixelFormat];
+        if (alias) {
+            alias->_viewParent = nil; alias->_usage = d.usage; alias->_ropt = t->_ropt; alias->_fbo = t->_fbo;
+            nvmtl_texture_desc_swizzle(alias, d);
+            return alias;
+        }
+    }
     if (nvmtl_surface_image_create(t, surf, plane, (uint32_t)w, (uint32_t)h, vkf, bpp, a8, wantStex)) {
         nvlog("newTextureWithDescriptor:iosurface:plane: image create FAILED (%zux%zu)", w, h); return nil; }
     t->_q = nvmtl_device_queue();
@@ -741,6 +791,8 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     t->_fmt = d.pixelFormat;
     t->_stex = t->_i.storage != 0;
     t->_usage = d.usage;
+    nvmtl_texture_desc_swizzle(t, d);
+    if (key && !t->_vramOn) [cache setObject:t forKey:key];
     nvlog("newTextureWithDescriptor:iosurface:%p plane:%lu -> %p (%zux%zu fmt %lu)",
           (void *)surf, (unsigned long)plane, (__bridge void *)t, w, h, (unsigned long)d.pixelFormat);
     return t; }
@@ -1257,6 +1309,9 @@ void nvmtl_gl_tag_reflection(id refl, MTLRenderPipelineDescriptor *d);
             (unsigned long)ad.offset, (unsigned long)ld.stride, (unsigned long)ld.stepFunction, (unsigned long)ld.stepRate];
     }
     ps->_vdesc = vdesc; ps->_descriptor = [d copy];
+    /* _descriptor keeps the caller's (unlinked) functions; a pixel-sampler variant re-translates from these, the
+     * stages the pipeline was actually built from (RenderBox's custom_fn fragments only translate once linked). */
+    ps->_linkedVert = vf; ps->_linkedFrag = noFrag ? nil : ff;
     if (!vf->_spirv.length || !ff->_spirv.length)
         return nvmtl_fail(err, [NSString stringWithFormat:
             @"pipeline: REFUSED — %@ is a visible function, not an entry point (vertex %lu B, fragment %lu B)",

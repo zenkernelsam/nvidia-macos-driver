@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "1.13.0"
-    static let name = "nullmoth-nvidia-1.13.0.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.13.0/nullmoth-nvidia-1.13.0.tar.gz")!
-    static let sha256 = "994970b1bba53e3ae8d7f500ef27b25cae8bc6818abc112d35230a58e6882fdf"
+    static let version = "1.15.0"
+    static let name = "nullmoth-nvidia-1.15.0.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.15.0/nullmoth-nvidia-1.15.0.tar.gz")!
+    static let sha256 = "6101cf8c37e4a500059ea8ce4d9f131ea107e35ccbeafcbb124d78a97e37e3ec"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -284,7 +284,7 @@ func makeReport(_ crashes: [URL]) -> String {
     var r = ""
     for u in crashes.suffix(3) {
         // The date and "before this install" ride in the header: 1.12 reports carried mediaanalysisd crashes from a 1.9
-        // plugin (the return address fits only 1.3-1.9's drawPrimitives) and read as a 1.12 regression (10-11).
+        // plugin (the return address fits only 1.3-1.9's drawPrimitives) and read as a 1.12 regression.
         let fmc = FileManager.default
         let when = (try? fmc.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date
         let installed = (try? fmc.attributesOfItem(atPath: "/Library/NullMoth/state"))?[.modificationDate] as? Date
@@ -388,6 +388,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "download": download()
         case "checkUpdate": checkUpdate()
         case "updateDriver": updateDriver(efi: b["efi"] as? String ?? "auto")
+        case "updateApp": updateApp()
         case "run":
             guard let mode = AppActions.directRunMode(b["mode"]) else { return }
             run(mode: mode, pkg: b["pkg"] as? String ?? "", efi: b["efi"] as? String ?? "auto", extra: [])
@@ -403,11 +404,23 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "optionalDiagnostics": optionalDiagnostics()
         case "importDiagnosticReceipt": importDiagnosticReceipt()
         case "verbose": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--verbose", (b["on"] as? Bool ?? false) ? "on" : "off"])
+        case "logo": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
+                         extra: ["--set-logo", (b["on"] as? Bool ?? true) ? "on" : "off",
+                                 "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path])
+        // the opt-in AMD/Intel GPU driver (setup --gpu-test); --tool tells setup where the firmware list sits
+        case "gputest": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
+                            extra: ["--gpu-test", (b["on"] as? Bool ?? false) ? "on" : "off",
+                                    "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path])
         default: break
         }
     }
 
     func scan() -> [String: Any] { App.scanMac(table) }
+    static func loadedDriverComponentCount(_ listing: String) -> Int {
+        let expected: Set<String> = ["com.nullmoth.NVRM", "com.nullmoth.NVRMFB", "com.nullmoth.NVAccel", "com.nullmoth.NVRMAGDC"]
+        let words = Set(listing.split(whereSeparator: { $0.isWhitespace }).map(String.init))
+        return expected.intersection(words).count
+    }
     static func scanMac(_ table: [String: Any]) -> [String: Any] {
         let ids = table["ids"] as? [String: String] ?? [:], tested = table["tested"] as? [String] ?? []
         let gpus: [[String: Any]] = pciDisplays().map { g in
@@ -420,7 +433,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let oc = sh("/usr/sbin/nvram", ["4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version"])
             .split(separator: "\t").dropFirst().first.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
-        let kexts = sh("/usr/bin/kmutil", ["showloaded", "--list-only"]).split(separator: "\n").filter { $0.contains("com.nullmoth.") }.count
+        let kexts = loadedDriverComponentCount(sh("/usr/bin/kmutil", ["showloaded", "--list-only"]))
         let fm = FileManager.default
         let files = fm.fileExists(atPath: "/Library/GPUBundles/NVMTLDriver.bundle") && fm.fileExists(atPath: "/Library/Extensions/NVRM.kext")
         var arch = "x86_64"
@@ -430,7 +443,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         let safe = sh("/usr/sbin/nvram", ["boot-args"]).split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains("-nvoff")
         return ["macos": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)", "major": os.majorVersion, "arch": arch,
                 "gpus": gpus, "opencore": oc, "kexts": kexts, "files": files, "metal": MTLCopyAllDevices().map { $0.name },
-                "packages": findPackages(), "version": Package.version, "safemode": safe,
+                "packages": findPackages(), "version": Package.version, "installedDriverVersion": recordedDriverVersion(), "safemode": safe,
                 "record": fm.fileExists(atPath: "/Library/NullMoth/state"), "crashes": driverCrashes().map(\.lastPathComponent),
                 "translated": sysctl("sysctl.proc_translated") == "1",
                 "profile": { var p = machineProfile(gpus); p["rules"] = Profile.select(rules(), p).ids; return p }()]
@@ -497,6 +510,12 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     var runningSetup = false
     lazy var downloadSession = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
     var latest: (version: String, name: String, url: URL, sha: String)? = nil
+    var latestApp: (version: String, name: String, url: URL, sha: String)? = nil
+    static func releaseAppVersion(_ name: String) -> String? {
+        guard let match = name.range(of: #"^1401-Mac-([0-9]+\.[0-9]+(?:\.[0-9]+)?)\.zip$"#, options: .regularExpression) else { return nil }
+        return String(name[match].dropFirst("1401-Mac-".count).dropLast(".zip".count))
+    }
+    var appVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0" }
     static func releaseDriverVersion(_ name: String) -> String? {
         guard let match = name.range(of: #"^nullmoth-nvidia-([0-9]+\.[0-9]+(?:\.[0-9]+)?)\.tar\.gz$"#, options: .regularExpression) else { return nil }
         return String(name[match].dropFirst("nullmoth-nvidia-".count).dropLast(".tar.gz".count))
@@ -507,9 +526,10 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         for i in 0..<max(x.count, y.count) { let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0; if p != q { return p > q } }
         return false
     }
-    func installedDriverVersion() -> String {
+    static func recordedDriverVersion() -> String {
         (try? String(contentsOfFile: "/Library/NullMoth/driver-version", encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
+    func installedDriverVersion() -> String { App.recordedDriverVersion() }
     func checkUpdate() {
         let api = URL(string: "https://api.github.com/repos/nullmoth/nvidia-macos-driver/releases/latest")!
         var rq = URLRequest(url: api); rq.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept"); rq.timeoutInterval = 30
@@ -518,10 +538,11 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             guard err == nil, (resp as? HTTPURLResponse)?.statusCode == 200, let data,
                   let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let assets = j["assets"] as? [[String: Any]] else { return fail("could not reach the release list (\(err?.localizedDescription ?? "HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))") }
-            var pkg: (String, String, URL)? = nil; var sums: URL? = nil
+            var pkg: (String, String, URL)? = nil; var sums: URL? = nil; var appz: (String, String, URL)? = nil
             for a in assets {
                 guard let n = a["name"] as? String, let u = (a["browser_download_url"] as? String).flatMap(URL.init(string:)), u.scheme == "https" else { continue }
                 if n == "SHA256SUMS.txt" { sums = u }
+                if let version = App.releaseAppVersion(n), appz == nil || App.newer(version, than: appz!.0) { appz = (version, n, u) }
                 if let version = App.releaseDriverVersion(n), pkg == nil || App.newer(version, than: pkg!.0) {
                     pkg = (version, n, u)
                 }
@@ -532,15 +553,25 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
                 let sha = txt.split(separator: "\n").compactMap { l -> String? in
                     let f = l.split(whereSeparator: { $0 == " " || $0 == "\t" }); return f.count >= 2 && f.last.map(String.init) == pkg.1 ? String(f[0]).lowercased() : nil }.first ?? ""
                 guard sha.count == 64 else { return fail("SHA256SUMS.txt does not list \(pkg.1)") }
-                DispatchQueue.main.async { self.latest = (pkg.0, pkg.1, pkg.2, sha) }
+                let shaOf: (String) -> String = { name in txt.split(separator: "\n").compactMap { l -> String? in
+                    let f = l.split(whereSeparator: { $0 == " " || $0 == "\t" }); return f.count >= 2 && f.last.map(String.init) == name ? String(f[0]).lowercased() : nil }.first ?? "" }
+                let appSha = appz.map { shaOf($0.1) } ?? ""
+                DispatchQueue.main.async {
+                    self.latest = (pkg.0, pkg.1, pkg.2, sha)
+                    if let a = appz, appSha.count == 64 { self.latestApp = (a.0, a.1, a.2, appSha) }
+                }
                 let have = self.installedDriverVersion()
+                let appNewer = appz.map { appSha.count == 64 && App.newer($0.0, than: self.appVersion) } ?? false
                 self.send("upd", ["state": "checked", "latest": pkg.0, "installed": have,
-                                  "newer": have.isEmpty || App.newer(pkg.0, than: have)])
+                                  "newer": have.isEmpty || App.newer(pkg.0, than: have),
+                                  "app": appz?.0 ?? "", "appHave": self.appVersion, "appNewer": appNewer])
             }.resume()
         }.resume()
     }
     func startDownload(name: String, sha: String, url: URL, efi: String?) {
-        guard pendingDownload == nil, !runningSetup else { return }
+        // A click while busy used to return silently, leaving "Downloading the newest driver..." on screen for good.
+        if pendingDownload != nil { send("dl", ["state": "error", "why": "a download is already running; wait for it to finish"]); return }
+        if runningSetup { send("dl", ["state": "error", "why": "setup is still running; try again when it has finished"]); return }
         do { try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true) }
         catch { send("dl", ["state": "error", "why": error.localizedDescription]); return }
         let task = downloadSession.downloadTask(with: url)
@@ -554,6 +585,54 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     }
     func download() {
         startDownload(name: Package.name, sha: Package.sha256, url: Package.url, efi: nil)
+    }
+    // "Update the app": the newest 1401 Mac app from the same release, checked against SHA256SUMS.txt, unpacked, checked
+    // again (bundle id, the version the release names, a valid signature), then swapped in place by a small script that
+    // waits for this app to quit, keeps the old copy as a backup, puts it back if the copy fails, and opens the new one.
+    // Users no longer download and reinstall the app by hand for every release.
+    func updateApp() {
+        let fail: (String) -> Void = { self.send("appupd", ["state": "error", "why": $0]) }
+        guard let l = latestApp else { return fail("check for updates first") }
+        let me = Bundle.main.bundleURL, parent = me.deletingLastPathComponent()
+        guard me.pathExtension == "app", FileManager.default.isWritableFile(atPath: parent.path) else {
+            return fail("1401 cannot replace itself in \(parent.path); move it to Applications, or download the new version from the site") }
+        let work = support.appendingPathComponent("app-update/\(l.version)")
+        try? FileManager.default.removeItem(at: work)
+        do { try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true) } catch { return fail(error.localizedDescription) }
+        send("appupd", ["state": "start", "version": l.version])
+        URLSession.shared.downloadTask(with: l.url) { loc, resp, err in
+            guard err == nil, (resp as? HTTPURLResponse)?.statusCode == 200, let loc else {
+                return fail("the download failed (\(err?.localizedDescription ?? "HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)"))") }
+            guard sha256(loc) == l.sha else { return fail("the download does not match its SHA-256, so it was thrown away") }
+            let zip = work.appendingPathComponent(l.name), out = work.appendingPathComponent("unpacked")
+            do { try FileManager.default.moveItem(at: loc, to: zip) } catch { return fail(error.localizedDescription) }
+            _ = sh("/usr/bin/ditto", ["-x", "-k", zip.path, out.path])
+            guard let new = (try? FileManager.default.contentsOfDirectory(at: out, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "app" }),
+                  let info = NSDictionary(contentsOf: new.appendingPathComponent("Contents/Info.plist")),
+                  info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+                  info["CFBundleShortVersionString"] as? String == l.version else { return fail("the download is not the 1401 \(l.version) app") }
+            let v = Process(); v.executableURL = URL(fileURLWithPath: "/usr/bin/codesign"); v.arguments = ["--verify", "--deep", new.path]
+            v.standardOutput = Pipe(); v.standardError = Pipe()
+            guard (try? v.run()) != nil else { return fail("could not check the new app's signature") }
+            v.waitUntilExit()
+            guard v.terminationStatus == 0 else { return fail("the new app's signature does not verify") }
+            let backup = support.appendingPathComponent("app-update/previous.app"), swap = work.appendingPathComponent("swap.sh")
+            let script = """
+            #!/bin/bash
+            pid=$1; old=$2; new=$3; bak=$4
+            for i in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+            rm -rf "$bak"; mv "$old" "$bak" || { open "$old"; exit 1; }
+            if ditto "$new" "$old"; then xattr -dr com.apple.quarantine "$old" 2>/dev/null; open "$old"
+            else rm -rf "$old"; mv "$bak" "$old"; open "$old"; fi
+            """
+            do { try script.write(to: swap, atomically: true, encoding: .utf8) } catch { return fail(error.localizedDescription) }
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/bash")
+            p.arguments = [swap.path, String(getpid()), me.path, new.path, backup.path]
+            p.standardInput = FileHandle.nullDevice; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return fail("could not start the update") }
+            self.send("appupd", ["state": "restarting", "version": l.version])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { NSApp.terminate(nil) }
+        }.resume()
     }
     func urlSession(_ s: URLSession, downloadTask t: URLSessionDownloadTask, didWriteData b: Int64, totalBytesWritten w: Int64, totalBytesExpectedToWrite e: Int64) {
         guard pendingDownload?.id == t.taskIdentifier else { return }
@@ -750,7 +829,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             if err != nil { errs.append("Some system logs could not be collected. See collect.txt for details.") }
             // Directory enumeration is unordered: a stick with many boot logs could crowd out
             // the GPU state, kernel log, or crash report. Always send those first.
-            let important = ["hardware-map.json", "driver-state.txt", "driver-kernel-log.txt", "driver-display.txt", "previous-boot-kernel-log.txt", "display-trace.txt", "display-kernel.txt", "display-ws.txt", "driver-plugin-log.txt", "crash-report.txt", "driver-wsreset.log.txt", "diagnostic-session.json", "collect.txt", "driver-update-log.txt"]
+            let important = ["hardware-map.json", "driver-state.txt", "driver-kernel-log.txt", "driver-display.txt", "previous-boot-kernel-log.txt", "display-trace.txt", "display-kernel.txt", "display-ws.txt", "gpu-all.txt", "driver-plugin-log.txt", "crash-report.txt", "driver-wsreset.log.txt", "diagnostic-session.json", "collect.txt", "driver-update-log.txt"]
             files.sort {
                 let a = supportCrashRank($0.lastPathComponent) ?? (important.firstIndex(of: $0.lastPathComponent) ?? important.count)
                 let b = supportCrashRank($1.lastPathComponent) ?? (important.firstIndex(of: $1.lastPathComponent) ?? important.count)
@@ -836,6 +915,24 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             send("run", ["state": "end", "mode": mode, "ok": false, "why": "Could not save a local report: \(error.localizedDescription)"])
             return
         }
+        // macOS checks its Removable Volumes privacy setting against this app even for the root shell that runs setup, so
+        // a USB stick's OpenCore config could not be opened there ("Code=257", seven Macs on 1.10 to 1.14.5, reported as
+        // "no OpenCore config"). Opening it here first lets macOS ask the user in 1401's name before setup needs it.
+        // Off the main thread and bounded: a stalled stick or a spun-down disk must not freeze the window (1.15 review).
+        // Network volumes are skipped: OpenCore never starts from them, and an unreachable share would only add a wait.
+        let preread = DispatchGroup()
+        DispatchQueue.global(qos: .userInitiated).async(group: preread) {
+            for volume in FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeIsInternalKey, .volumeIsLocalKey], options: [.skipHiddenVolumes]) ?? [] {
+                let values = try? volume.resourceValues(forKeys: [.volumeIsInternalKey, .volumeIsLocalKey])
+                if values?.volumeIsInternal == true || values?.volumeIsLocal == false { continue }
+                for rel in ["EFI/OC/config.plist", "EFI/BOOT/config.plist"] {
+                    let file = volume.appendingPathComponent(rel)
+                    guard FileManager.default.fileExists(atPath: file.path), let handle = FileHandle(forReadingAtPath: file.path) else { continue }
+                    _ = handle.readData(ofLength: 1); handle.closeFile()
+                }
+            }
+        }
+        _ = preread.wait(timeout: .now() + 3)
         let res = Bundle.main.resourceURL!
         var args: [String]
         switch mode {
