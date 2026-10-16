@@ -19,6 +19,8 @@
     int aheadFailed;
     BOOL waitFolded;
     BOOL aheadEmpty;
+    NSArray<NVMTLBuffer *> *copyInputs;
+    BOOL copyInputsPrepared, hasHostCopies;
 }
 @end
 static _Atomic unsigned gsub_inflight;
@@ -133,12 +135,27 @@ static int nvmtl_skip_empty_on(void) {
     NVMTLSubmissionPart *part = [NVMTLSubmissionPart new];
     part->commands = _c;
     memset(&_c, 0, sizeof(_c));
-    part->resources = [_resources copy]; part->surfaces = [_surfDirty copy];
+    part->resources = [(NVMTLResSet *)_resources nvmtlTakeAll]; part->surfaces = [_surfDirty copy];
+    // Another process may read an IOSurface once its writer is scheduled, and nothing orders its queue after ours.
+    static int after = -1; if (after < 0) { const char *e = getenv("NVMTL_SCHEDULE_AFTER_SURFACE_WRITES"); after = e && e[0] == '1'; }
+    NVMTLTexture *drawable = _present ? (_present->_parent ?: _present) : nil;
+    for (NVMTLTexture *s in part->surfaces) if (after && s != drawable) _scheduleAfterPublish = YES;
     part->scratch = [_scratch copy]; part->signalEvent = event; part->value = value;
     part->encoders = _nEnc - _nEncSealed; _nEncSealed = _nEnc;
     if (_g79Sig.count) { part->signals = [_g79Sig copy]; [_g79Sig removeAllObjects]; }
     [_parts addObject:part];
-    [_resources removeAllObjects]; [_surfDirty removeAllObjects]; [_scratch removeAllObjects];
+    [_surfDirty removeAllObjects]; [_scratch removeAllObjects];
+    // The repeated-setBytes cache points at ring chunks without owning them; the part now owns those chunks and frees
+    // them when it completes, which can happen while this command buffer is still being encoded. A cache entry that
+    // outlived its chunk was bound and retained again by the next identical setBytes, and the compute encoder's binding
+    // table later released a freed object (mediaanalysisd under MPS convolution, endEncoding / .cxx_destruct).
+    memset(_g79BRing, 0, sizeof _g79BRing); memset(_g79BLen, 0, sizeof _g79BLen);
+    // Recording goes on after this seal, and the encoders' binding tables still name these resources by raw Vulkan
+    // handle: a later dispatch snapshots them again without rebinding. The command buffer keeps holding them until it
+    // completes, as Metal's do. WAS: only the part held them, so a texture the app had released died when that part
+    // completed and the next dispatch wrote its destroyed image view (NVK abort in get_sampled_image_view_desc under
+    // nvk_UpdateDescriptorSets: mediaanalysisd, Safari, wallpapers).
+    if (restart) for (id o in (NVMTLResSet *)part->resources) [(NVMTLResSet *)_resources addObject:o];
     if (restart && nvmtl_vk_cmd_begin(&_queue->_q, &_c)) {
         _cbError = [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorOutOfMemory
             userInfo:@{NSLocalizedDescriptionKey:@"Could not allocate recording after event boundary"}];
@@ -200,6 +217,7 @@ static int nvmtl_skip_empty_on(void) {
     });
 }
 - (void)nvmtlMarkScheduled {
+    if (_scheduleAfterPublish) return;
     [_completionCondition lock];
     if (!_wasScheduled) {
         _wasScheduled = YES; _cbstatus = MTLCommandBufferStatusScheduled;
@@ -218,6 +236,7 @@ static int nvmtl_skip_empty_on(void) {
     }
 }
 - (void)nvmtlFinishExecution:(NSError *)error {
+    if (_scheduleAfterPublish) { _scheduleAfterPublish = NO; [self nvmtlMarkScheduled]; }
     for (NSUInteger i = _nextPart; i < _parts.count; i++) {
         NVMTLSubmissionPart *p = _parts[i];
         if (![p isKindOfClass:[NVMTLSubmissionPart class]] || !p->inflight) continue;
@@ -244,6 +263,12 @@ static int nvmtl_skip_empty_on(void) {
     _executionDone = YES;
     [_completionCondition unlock];
     [_parts removeAllObjects];
+    // A finished command buffer lets go of everything only its GPU work needed: the setBytes ring and the scratch
+    // buffers it filled, and any resources still listed on it. Apple's command buffers do the same. An app's
+    // autorelease pool can keep thousands of finished command buffers alive during a long loop (Geekbench 7 does),
+    // and holding these until the command buffer itself died filled VRAM until allocations were refused.
+    [_scratch removeAllObjects]; _e78Ring = nil; _e78RingOff = 0; memset(_g79BRing, 0, sizeof _g79BRing);
+    [(NVMTLResSet *)_resources removeAllObjects]; [_stTwins removeAllObjects];
     // Applications may retain completed command buffers. Pending overwrite
     // bookkeeping must not keep their IOSurfaces and VRAM alive indefinitely.
     [_surfOverwrites removeAllObjects]; _surfOverwrites = nil;
@@ -300,6 +325,36 @@ static void nvmtl_gsub_census(void) {
           (unsigned long long)s[1], (unsigned long long)s[2], (unsigned long long)s[3], (unsigned long long)s[4],
           (unsigned long long)s[5], (unsigned long long)s[6], (unsigned long long)s[7], (unsigned long long)s[8]);
 }
+// A texture over a copy-backed buffer must refresh the same bytes as a direct
+// buffer binding. Keep direct managed-buffer writeback and copy each backing once.
+static NSArray<NVMTLBuffer *> *nvmtl_submission_copies(NSSet *resources, BOOL writtenOnly) {
+    NSMutableSet<NVMTLBuffer *> *copies = nil;
+    for (id resource in resources) {
+        NVMTLBuffer *buffer = nil;
+        if ([resource isKindOfClass:[NVMTLBuffer class]]) buffer = resource;
+        else if ([resource isKindOfClass:[NVMTLTexture class]]) {
+            NVMTLTexture *texture = resource;
+            if (writtenOnly && texture->_usage != MTLTextureUsageUnknown &&
+                !(texture->_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget))) continue;
+            buffer = texture->_backBuf ?: (texture->_parent ? texture->_parent->_backBuf : nil);
+        }
+        if (!buffer || (!buffer->_hostPtr && !buffer->_shadow.map)) continue;
+        if (!copies) copies = [NSMutableSet new];
+        [copies addObject:buffer];
+    }
+    return copies.allObjects;
+}
+static void nvmtl_prepare_submission_copies(NVMTLSubmissionPart *part) {
+    if (part->copyInputsPrepared) return;
+    // A sealed part's membership and its buffers' backing modes do not change.
+    // The ahead pass can retry a held part many times: discover its upload
+    // backings once, but refresh their bytes only when it actually submits.
+    part->copyInputs = nvmtl_submission_copies(part->resources, NO);
+    for (NVMTLBuffer *buffer in part->copyInputs) {
+        if (buffer->_hostPtr) { part->hasHostCopies = YES; break; }
+    }
+    part->copyInputsPrepared = YES;
+}
 - (BOOL)nvmtlSubmitAhead {
     if (_executionDone || _cbError || !_committed) return NO;
     if (_nextSubmit < _nextPart) _nextSubmit = _nextPart;
@@ -323,16 +378,15 @@ static void nvmtl_gsub_census(void) {
             nvmtl_evfold_census(&gEvFoldEmpty, "empty split parts retired by the ahead pass");
             continue;
         }
+        nvmtl_prepare_submission_copies(part);
         {
             static int hold = -1;
             if (hold < 0) { const char *e = getenv("NVMTL_GSUB_HOSTPTR_LIFT"); hold = (e && *e && *e != '0') ? 0 : 1; }
-            if (hold) {
-                for (id resource in part->resources)
-                    if ([resource isKindOfClass:[NVMTLBuffer class]] && ((NVMTLBuffer *)resource)->_hostPtr) return NO;
-            }
+            if (hold && part->hasHostCopies) return NO;
         }
         nvmtl_inflight *f = nvmtl_vk_inflight_new();
         if (!f) return NO;
+        for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
         [self nvmtlMarkScheduled];
         if (!_legacyKernelStart) _legacyKernelStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9;
         const int r = nvmtl_vk_submit_begin(&part->commands, f);
@@ -401,8 +455,8 @@ static void nvmtl_gsub_ahead_pass1(void) {
         if (part->inflight) result = nvmtl_gsub_finish(part);
         else if (part->aheadFailed) result = part->aheadFailed;
         else {
-            for (id resource in part->resources)
-                if ([resource isKindOfClass:[NVMTLBuffer class]]) nvmtl_buffer_sync_in(resource);
+            nvmtl_prepare_submission_copies(part);
+            for (NVMTLBuffer *buffer in part->copyInputs) nvmtl_buffer_sync_in(buffer);
             result = nvmtl_vk_submit_wait(&part->commands);
         }
         if (result == -2) {
@@ -413,8 +467,7 @@ static void nvmtl_gsub_ahead_pass1(void) {
         BOOL published = result == 0;
         if (published) {
             for (NVMTLTexture *texture in part->surfaces) if (![texture nvmtlSurfaceOut]) published = NO;
-            for (id resource in part->resources)
-                if ([resource isKindOfClass:[NVMTLBuffer class]]) nvmtl_buffer_sync_out(resource);
+            for (NVMTLBuffer *buffer in nvmtl_submission_copies(part->resources, YES)) nvmtl_buffer_sync_out(buffer);
         }
         if (!published) {
             [self nvmtlFinishExecution:[NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal

@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "1.15.0"
-    static let name = "nullmoth-nvidia-1.15.0.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v1.15.0/nullmoth-nvidia-1.15.0.tar.gz")!
-    static let sha256 = "6101cf8c37e4a500059ea8ce4d9f131ea107e35ccbeafcbb124d78a97e37e3ec"
+    static let version = "2.0.4"
+    static let name = "nullmoth-nvidia-2.0.4.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.0.4/nullmoth-nvidia-2.0.4.tar.gz")!
+    static let sha256 = "ae307a431cb0e964757c15ed68d090508e2d85d01160599fbe9b899ae9ccf81b"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -26,6 +26,20 @@ func sh(_ path: String, _ args: [String]) -> String {
     return String(decoding: d, as: UTF8.self)
 }
 func sysctl(_ k: String) -> String { sh("/usr/sbin/sysctl", ["-n", k]).trimmingCharacters(in: .whitespacesAndNewlines) }
+// A small, bounded https GET used to fetch an update's detached signature before unpacking it. Returns nil on any
+// non-200, non-https, timeout, or transport error. Runs off the main thread (the updater's completion handlers do).
+func syncGet(_ url: URL, timeout: TimeInterval) -> Data? {
+    guard url.scheme == "https" else { return nil }
+    var out: Data? = nil
+    let sem = DispatchSemaphore(value: 0)
+    var rq = URLRequest(url: url); rq.timeoutInterval = timeout
+    URLSession.shared.dataTask(with: rq) { d, resp, _ in
+        if (resp as? HTTPURLResponse)?.statusCode == 200 { out = d }
+        sem.signal()
+    }.resume()
+    _ = sem.wait(timeout: .now() + timeout + 5)
+    return out
+}
 func sha256(_ url: URL) -> String? {
     guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
     defer { try? h.close() }
@@ -265,8 +279,24 @@ func failurePart(_ u: URL) -> String {
             var parts: [String] = []
             if let ex = j["exception"] { parts.append("exception: \(ex)") }
             if let te = j["termination"] { parts.append("termination: \(te)") }
+            // Which memory the bad address fell in (a surface, a staging buffer, freed heap) and which plugin build
+            // was loaded: the header names the package installed now, which may not be the one that crashed.
+            if let vm = j["vmRegionInfo"] as? String { parts.append("vm region: \(vm.prefix(600))") }
+            if let imgs = j["usedImages"] as? [[String: Any]] {
+                for im in imgs where ["NVMTLDriver", "libvulkan_nouveau.dylib", "libnvmtl_translate.dylib"].contains(im["name"] as? String ?? "") {
+                    parts.append("loaded \(im["name"] as? String ?? "?") uuid \(im["uuid"] as? String ?? "?")")
+                }
+            }
             if let fi = j["faultingThread"] as? Int, let th = j["threads"] as? [[String: Any]], fi < th.count,
                let fr = th[fi]["frames"] as? [[String: Any]], let imgs = j["usedImages"] as? [[String: Any]] {
+                if let ts = th[fi]["threadState"] as? [String: Any] {
+                    let names = ["rip", "rdi", "rsi", "rdx", "rcx", "rax", "rbx", "r8", "r9", "cr2", "x0", "x1", "x2", "x3", "pc", "far"]
+                    let regs = names.compactMap { n -> String? in
+                        guard let v = (ts[n] as? [String: Any])?["value"] as? NSNumber else { return nil }
+                        return "\(n)=0x" + String(v.uint64Value, radix: 16)
+                    }
+                    if !regs.isEmpty { parts.append("registers: " + regs.joined(separator: " ")) }
+                }
                 parts.append("crashed thread \(fi):")
                 for (i, f) in fr.prefix(40).enumerated() {
                     let ii = f["imageIndex"] as? Int ?? -1
@@ -407,10 +437,26 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "logo": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
                          extra: ["--set-logo", (b["on"] as? Bool ?? true) ? "on" : "off",
                                  "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path])
+        case "backlight": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
+                              extra: ["--backlight", (b["on"] as? Bool ?? false) ? "on" : "off"])
         // the opt-in AMD/Intel GPU driver (setup --gpu-test); --tool tells setup where the firmware list sits
-        case "gputest": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
-                            extra: ["--gpu-test", (b["on"] as? Bool ?? false) ? "on" : "off",
-                                    "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path])
+        // a Mac with no NVIDIA card has no driver install behind it: the checked package rides along so setup can take
+        // the AMD/Intel test driver from it (setup verifies the SHA-256 again on a root-owned copy)
+        case "gputest":
+            let pk = (b["pkg"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto",
+                extra: ["--gpu-test", (b["on"] as? Bool ?? false) ? "on" : "off",
+                        "--tool", Bundle.main.resourceURL!.appendingPathComponent("NullMothSafe.efi").path]
+                    + (pk.map { ["--pkg", $0, "--sha", Package.sha256] } ?? []))
+        // macOS 15 -> 26: setup's one-button path ("--update prepare" with the package) installs or updates the driver,
+        // then parks it and sets the installer's small BAR; "--update cancel" puts it all back before the update
+        case "osupdate":
+            if b["cancel"] as? Bool ?? false {
+                run(mode: "tahoecancel", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--update", "cancel"])
+            } else if let pk = b["pkg"] as? String, !pk.isEmpty {
+                run(mode: "tahoe", pkg: pk, efi: b["efi"] as? String ?? "auto", extra: ["--update", "prepare"])
+            }
+        case "swupdate": NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Software-Update-Settings.extension")!)
         default: break
         }
     }
@@ -441,12 +487,52 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         arch = "arm64"
         #endif
         let safe = sh("/usr/sbin/nvram", ["boot-args"]).split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" }).contains("-nvoff")
+        let metal = metalDevices()
+        // Why no NVIDIA card shows up, when that is the case. Users on hybrid laptops copy -wegnoegpu / -wegonogpu from
+        // laptop guides (it hides every discrete GPU, NVIDIA included), and a disable-gpu property or a dGPU-off SSDT
+        // does the same: the card is then on the bus with another class code, or not on the bus at all.
+        let hiding = sysctl("kern.bootargs").split(separator: " ").map(String.init)
+            .filter { ["-wegnoegpu", "-wegonogpu", "-nvoff", "-wegnoigpu"].contains($0) }
+        let hiddenNvidia = services("IOPCIDevice").compactMap { s -> String? in
+            defer { IOObjectRelease(s) }
+            guard u32(s, "vendor-id").map({ $0 & 0xffff }) == 0x10DE, let cls = u32(s, "class-code"), cls >> 16 != 0x03,
+                  cls >> 16 != 0x04, let d = u32(s, "device-id") else { return nil }
+            return String(format: "10DE:%04X", d & 0xffff)
+        }
         return ["macos": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)", "major": os.majorVersion, "arch": arch,
-                "gpus": gpus, "opencore": oc, "kexts": kexts, "files": files, "metal": MTLCopyAllDevices().map { $0.name },
+                "gpus": gpus, "opencore": oc, "kexts": kexts, "files": files, "metal": metal.names, "metalSource": metal.source,
                 "packages": findPackages(), "version": Package.version, "installedDriverVersion": recordedDriverVersion(), "safemode": safe,
                 "record": fm.fileExists(atPath: "/Library/NullMoth/state"), "crashes": driverCrashes().map(\.lastPathComponent),
-                "translated": sysctl("sysctl.proc_translated") == "1",
+                "translated": sysctl("sysctl.proc_translated") == "1", "gpuHiding": hiding, "hiddenNvidia": hiddenNvidia,
+                "hwModel": sysctl("hw.model"),
                 "profile": { var p = machineProfile(gpus); p["rules"] = Profile.select(rules(), p).ids; return p }()]
+    }
+
+    /// Metal device names, listed by nullmoth-metal-devices: this app runs with library validation, which refuses the
+    /// ad-hoc signed NVIDIA Metal plugin, so a list taken in this process would leave the card out and the window would
+    /// say the driver is not running. Bounded at 10 s. If the helper cannot run, the in-process list is used and
+    /// "metalSource" says so in the report.
+    static func metalDevices() -> (names: [String], source: String) {
+        let p = Process()
+        p.executableURL = Bundle.main.resourceURL!.appendingPathComponent("nullmoth-metal-devices")
+        let o = Pipe(); p.standardOutput = o; p.standardError = Pipe()
+        let done = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in done.signal() }
+        var out = Data()
+        let reader = DispatchQueue.global(qos: .userInitiated)
+        let read = DispatchGroup()
+        do { try p.run() } catch { return (MTLCopyAllDevices().map { $0.name }, "in-process (helper did not start)") }
+        reader.async(group: read) { out = o.fileHandleForReading.readDataToEndOfFile() }
+        if done.wait(timeout: .now() + 10) == .timedOut {
+            p.terminate()
+            return (MTLCopyAllDevices().map { $0.name }, "in-process (helper timed out)")
+        }
+        _ = read.wait(timeout: .now() + 2)
+        guard p.terminationStatus == 0 else {
+            return (MTLCopyAllDevices().map { $0.name }, "in-process (helper exited \(p.terminationStatus))")
+        }
+        let names = String(decoding: out, as: UTF8.self).split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return (names, "helper")
     }
 
     static func rules() -> [String: Any] {
@@ -510,7 +596,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     var runningSetup = false
     lazy var downloadSession = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
     var latest: (version: String, name: String, url: URL, sha: String)? = nil
-    var latestApp: (version: String, name: String, url: URL, sha: String)? = nil
+    var latestApp: (version: String, name: String, url: URL, sha: String, sig: URL?)? = nil
     static func releaseAppVersion(_ name: String) -> String? {
         guard let match = name.range(of: #"^1401-Mac-([0-9]+\.[0-9]+(?:\.[0-9]+)?)\.zip$"#, options: .regularExpression) else { return nil }
         return String(name[match].dropFirst("1401-Mac-".count).dropLast(".zip".count))
@@ -556,9 +642,15 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
                 let shaOf: (String) -> String = { name in txt.split(separator: "\n").compactMap { l -> String? in
                     let f = l.split(whereSeparator: { $0 == " " || $0 == "\t" }); return f.count >= 2 && f.last.map(String.init) == name ? String(f[0]).lowercased() : nil }.first ?? "" }
                 let appSha = appz.map { shaOf($0.1) } ?? ""
+                // The release carries a detached Ed25519 signature named "<app zip>.sig" beside the app zip; its URL
+                // is remembered so updateApp() can verify it against the compiled-in release key before unpacking.
+                let appSig: URL? = appz.flatMap { a in assets.compactMap { x -> URL? in
+                    guard let n = x["name"] as? String, n == a.1 + ".sig",
+                          let u = (x["browser_download_url"] as? String).flatMap(URL.init(string:)), u.scheme == "https" else { return nil }
+                    return u }.first }
                 DispatchQueue.main.async {
                     self.latest = (pkg.0, pkg.1, pkg.2, sha)
-                    if let a = appz, appSha.count == 64 { self.latestApp = (a.0, a.1, a.2, appSha) }
+                    if let a = appz, appSha.count == 64 { self.latestApp = (a.0, a.1, a.2, appSha, appSig) }
                 }
                 let have = self.installedDriverVersion()
                 let appNewer = appz.map { appSha.count == 64 && App.newer($0.0, than: self.appVersion) } ?? false
@@ -606,6 +698,14 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             guard sha256(loc) == l.sha else { return fail("the download does not match its SHA-256, so it was thrown away") }
             let zip = work.appendingPathComponent(l.name), out = work.appendingPathComponent("unpacked")
             do { try FileManager.default.moveItem(at: loc, to: zip) } catch { return fail(error.localizedDescription) }
+            // The SHA-256 above only proves the download matches what the release page lists; an attacker who controls
+            // that page controls both. Refuse to unpack unless a detached Ed25519 signature over the exact zip bytes
+            // verifies against the compiled-in NullMoth release key (R2).
+            guard let sigURL = l.sig else { return fail("this release is not signed by NullMoth, so it was not installed") }
+            guard let sigData = syncGet(sigURL, timeout: 30), let sigText = String(data: sigData, encoding: .utf8) else {
+                return fail("could not download the update's signature, so it was not installed") }
+            guard ReleaseSignature.verify(zip: zip, signatureBase64: sigText) else {
+                return fail("the update's signature is not from NullMoth, so it was not installed") }
             _ = sh("/usr/bin/ditto", ["-x", "-k", zip.path, out.path])
             guard let new = (try? FileManager.default.contentsOfDirectory(at: out, includingPropertiesForKeys: nil))?.first(where: { $0.pathExtension == "app" }),
                   let info = NSDictionary(contentsOf: new.appendingPathComponent("Contents/Info.plist")),
@@ -750,8 +850,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
                 return
             }
             let script = Bundle.main.resourceURL!.appendingPathComponent("nullmoth-log-capture.sh").path
-            let q = { (x: String) in "'" + x.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-            let cmd = (sample.isEmpty ? "" : "NULLMOTH_SAMPLE=\(sample) ") + "/bin/bash \(q(script))"
+            let cmd = Privileged.bundleScript(script, [], env: sample.isEmpty ? "" : "NULLMOTH_SAMPLE=\(sample) ")
             var collectionErrors: [String] = []
             DispatchQueue.main.async {
                 self.send("logsStatus", ["text": "Waiting for your Mac password (a macOS window asks for it). Collecting takes a few minutes; 1401 keeps working."])
@@ -900,7 +999,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
     }
 
     func run(mode: String, pkg: String, efi: String, extra: [String], expectedSha: String? = nil) {
-        guard ["dry", "install", "remove", "usbmap", "verbose"].contains(mode),
+        guard ["dry", "install", "remove", "usbmap", "verbose", "tahoe", "tahoecancel"].contains(mode),
               !runningSetup, pendingDownload == nil else { return }
         runningSetup = true
         let log: URL
@@ -937,7 +1036,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         var args: [String]
         switch mode {
         case "remove": args = ["--remove"]
-        case "usbmap", "verbose": args = extra
+        case "usbmap", "verbose", "tahoecancel": args = extra
         default:
             args = ["--pkg", pkg, "--sha", expectedSha ?? Package.sha256, "--tool", res.appendingPathComponent("NullMothSafe.efi").path,
                     "--app", Bundle.main.executablePath ?? ""]
@@ -954,8 +1053,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
             args += extra
         }
         if efi != "auto", !efi.isEmpty { args += ["--efi", efi] }
-        let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
-        let cmd = "/bin/bash \(q(res.appendingPathComponent("nullmoth-operation-capture.sh").path)) \(args.map(q).joined(separator: " "))"
+        let cmd = Privileged.bundleScript(res.appendingPathComponent("nullmoth-operation-capture.sh").path, args)
         send("run", ["state": "start", "mode": mode, "log": log.path])
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.global().async {

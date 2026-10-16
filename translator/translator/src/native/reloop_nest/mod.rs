@@ -12,6 +12,31 @@ pub(crate) fn structure_selected_functions(
     module: &mut Module,
     selected: &HashSet<Word>,
 ) -> HashSet<Word> {
+    // METAL2VULKAN_NEST: unset = every stage; "0" = never nest; otherwise a comma list of
+    // kernel,fragment,vertex naming the stages that may nest (the rest keep the raw relooper).
+    if let Some(allowed) = std::env::var_os("METAL2VULKAN_NEST") {
+        let allowed = allowed.to_string_lossy().to_ascii_lowercase();
+        let model = module.entry_points.first().and_then(|ep| match ep.operands.first() {
+            Some(crate::spirv_module::Operand::ExecutionModel(model)) => Some(*model),
+            _ => None,
+        });
+        let stage = match model {
+            Some(spirv::ExecutionModel::GLCompute) => "kernel",
+            Some(spirv::ExecutionModel::Fragment) => "fragment",
+            Some(spirv::ExecutionModel::Vertex) => "vertex",
+            _ => "other",
+        };
+        if allowed.trim() == "0"
+            || !allowed
+                .split(',')
+                .any(|a| a.trim() == stage || a.trim() == "all")
+        {
+            if crate::env_vars::reloop_why() {
+                eprintln!("NEST-SKIP stage={stage} METAL2VULKAN_NEST={allowed}");
+            }
+            return HashSet::new();
+        }
+    }
     let mut next_id = module
         .header
         .as_ref()
@@ -441,14 +466,21 @@ mod tests {
                OpFunctionEnd
 "#;
 
+    // A use its definition does not dominate used to make the nesting decline the whole function. repair_dominance
+    // now carries such a value through a function variable (store after the definition, load before the use), so the
+    // function nests and the result must still be valid SPIR-V. On the path that never defines the value it reads an
+    // unwritten variable, which is what the source said: undefined there.
     #[test]
-    fn nesting_declines_a_use_its_definition_does_not_dominate() {
+    fn nesting_repairs_a_use_its_definition_does_not_dominate() {
         let Some(spv) = assemble(USE_WITHOUT_DOMINATING_DEFINITION) else {
             return;
         };
+        let nested = nested_bytes(&spv).expect("the function nests once its value flow is repaired");
+        assert!(validates(&nested), "the repaired function must pass spirv-val");
+        let text = disassemble(&nested);
         assert!(
-            nested_bytes(&spv).is_none(),
-            "a function whose value flow the nesting cannot honour must stay on the state machine"
+            text.contains("OpVariable") && text.contains("OpStore") && text.contains("OpLoad"),
+            "the value is carried through a function variable"
         );
     }
 

@@ -23,6 +23,8 @@
 extern "C" {
 #include <mach/mach_types.h>
 #include <sys/proc.h>
+#include <sys/kauth.h>
+#include <sys/sysctl.h>
 
 #include "nvrm_gpuva_abi.h"
 #define NVRM_SS_KERNEL_ABI 1
@@ -110,7 +112,25 @@ public:
     volatile UInt32 fBootHold = 0;
     virtual IOReturn callPlatformFunction(const OSSymbol *fn, bool wait,
                                          void *p1, void *p2, void *p3, void *p4) override;
+    virtual IOReturn setPowerState(unsigned long ordinal, IOService *device) override;
 private:
+    // System sleep (S3). NVRM is a power child of the GPU's IOPCIDevice, so it is told to power off before the slot
+    // loses power and to power on once IOPCIFamily has the device back in D0.
+    enum { kGpuPmRunning = 0, kGpuPmSuspended = 1, kGpuPmLost = 2 };
+    volatile SInt32 fGpuPm = kGpuPmRunning;
+    bool         fPmJoined = false;
+    unsigned     fPmCycles = 0;
+    struct PciSave {
+        bool valid; UInt32 rbOff[6], rbCtl[6]; unsigned rbCount;
+        UInt32 bar[6]; UInt16 cmd;
+        IOPCIDevice *rp; UInt32 rpWin[6]; UInt16 rpCmd;   // root port 0x18..0x2c and command
+    } fPciSave = {};
+    void gpuSuspend();
+    void gpuResume();
+    void pciSaveForSleep();
+    bool pciRestoreAfterWake();
+    bool gpuAnswers();
+    void notifyFramebuffers(uintptr_t state);
     IOPCIDevice *fPCI = NULL;
     nv_state_t   fNv = {};
     bool         fPrivateState = false;
@@ -125,6 +145,75 @@ private:
 };
 extern "C" { extern volatile int nv_xnu_in_isr; extern volatile thread_t nv_xnu_isr_thread; void nv_xnu_dump_live_allocs(void); }
 static volatile unsigned long gNvIsrCount = 0, gNvIsrHandled = 0;
+// Read from a shell (also over SSH while the screen is frozen): do GPU interrupts still arrive and get handled?
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_isr_count, CTLFLAG_RD, (int64_t *)&gNvIsrCount, "GPU MSIs taken");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_isr_handled, CTLFLAG_RD, (int64_t *)&gNvIsrHandled, "GPU MSIs RM claimed");
+static volatile SInt64 gNvEvtPosts = 0, gNvEvtMatched = 0, gNvEvtWaits = 0, gNvEvtSlept = 0;
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_evt_posts, CTLFLAG_RD, (int64_t *)&gNvEvtPosts, "RM events posted to user clients");
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_evt_waits, CTLFLAG_RD, (int64_t *)&gNvEvtWaits, "user event waits");
+
+// System sleep gate, the nv_system_pm_lock of kernel-open/nvidia/nv.c. Linux freezes user space before suspend and
+// still takes that lock in every ioctl; macOS freezes nothing, so on wake WindowServer and Metal apps called into RM
+// while the GPU was still in standby (an auto-unmap mid-standby broke the GMMU walk, TLB invalidates
+// failed and RESUME took 31 s; NVK got errors and WindowServer froze on the restored frame). The PM thread
+// closes the gate before NVKMS suspend and opens it after RM and NVKMS resume; calls arriving meanwhile wait.
+static IOLock  *gNvPmGate;
+static int      gNvPmUsers;
+static bool     gNvPmClosed;
+static thread_t gNvPmOwner;
+static SInt64   gNvPmWaited;
+SYSCTL_QUAD(_debug, OID_AUTO, nvrm_pm_waited, CTLFLAG_RD, &gNvPmWaited, "RM calls that waited for a GPU resume");
+extern "C" int nv_xnu_pm_enter(void)
+{
+    if (!gNvPmGate || current_thread() == gNvPmOwner) return 0;
+    IOLockLock(gNvPmGate);
+    if (gNvPmClosed) {
+        OSIncrementAtomic64(&gNvPmWaited);
+        while (gNvPmClosed) IOLockSleep(gNvPmGate, &gNvPmClosed, THREAD_UNINT);
+    }
+    gNvPmUsers++;
+    IOLockUnlock(gNvPmGate);
+    return 1;
+}
+extern "C" void nv_xnu_pm_exit(int counted)
+{
+    if (!counted || !gNvPmGate) return;
+    IOLockLock(gNvPmGate);
+    if (--gNvPmUsers == 0 && gNvPmClosed) IOLockWakeup(gNvPmGate, &gNvPmUsers, false);
+    IOLockUnlock(gNvPmGate);
+}
+// Close the gate and wait up to waitMs for the calls already inside RM. Returns how many were still inside.
+static int nv_xnu_pm_close(uint32_t waitMs)
+{
+    if (!gNvPmGate) return 0;
+    uint64_t deadline; clock_interval_to_deadline(waitMs, kMillisecondScale, &deadline);
+    IOLockLock(gNvPmGate);
+    gNvPmClosed = true;
+    gNvPmOwner = current_thread();
+    while (gNvPmUsers > 0)
+        if (IOLockSleepDeadline(gNvPmGate, &gNvPmUsers, deadline, THREAD_UNINT) == THREAD_TIMED_OUT) break;
+    const int left = gNvPmUsers;
+    IOLockUnlock(gNvPmGate);
+    return left;
+}
+// System wake runs on another PM thread than the sleep that closed the gate: hand it the gate before RM and NVKMS
+// resume (nvKmsResume's RM calls waited at the gate on the wake thread until the 180 s wake watchdog panicked).
+static void nv_xnu_pm_take(void)
+{
+    if (!gNvPmGate) return;
+    IOLockLock(gNvPmGate);
+    gNvPmOwner = current_thread();
+    IOLockUnlock(gNvPmGate);
+}
+static void nv_xnu_pm_open(void)
+{
+    if (!gNvPmGate) return;
+    IOLockLock(gNvPmGate);
+    gNvPmClosed = false;
+    gNvPmOwner = NULL;
+    IOLockWakeup(gNvPmGate, &gNvPmClosed, false);
+    IOLockUnlock(gNvPmGate);
+}
 
 static inline void nvu_memset(void *d, int c, size_t n) { __asm__ __volatile__("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory"); }
 static inline void nvu_memcpy(void *d, const void *s, size_t n) { __asm__ __volatile__("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory"); }
@@ -245,7 +334,7 @@ extern "C" nv_alloc_mapping_context_t *nv_xnu_mmap_context(void *priv)
     return c ? c->mmapContext() : NULL;
 }
 extern "C" IOMemoryDescriptor *nv_xnu_alloc_md(void *priv, NvU64 *bytes, NvU32 *cache);
-extern "C" { IOMemoryDescriptor *nv_pm_ram_submd(NvU64, NvU64); bool nv_pm_is_gpu(NvU64, NvU64); void nv_pm_dev_refused(NvU64, NvU64); bool nv_xnu_chat(void); }
+extern "C" { IOMemoryDescriptor *nv_pm_ram_submd(NvU64, NvU64, int); bool nv_pm_is_gpu(NvU64, NvU64); void nv_pm_dev_refused(NvU64, NvU64); bool nv_xnu_chat(void); }
 
 #define super IOService
 OSDefineMetaClassAndStructors(NVRM, IOService)
@@ -288,6 +377,15 @@ bool NVRM::start(IOService *provider)
     if (!fPCI) return false;
     gNVRMService = this;
     nv_xnu_log_init();
+    {
+        static bool sysctlsUp;
+        if (!sysctlsUp) {
+            sysctlsUp = true;
+            sysctl_register_oid(&sysctl__debug_nvrm_isr_count); sysctl_register_oid(&sysctl__debug_nvrm_isr_handled);
+            sysctl_register_oid(&sysctl__debug_nvrm_evt_posts); sysctl_register_oid(&sysctl__debug_nvrm_evt_waits);
+            sysctl_register_oid(&sysctl__debug_nvrm_pm_waited);
+        }
+    }
     UInt8 bus = fPCI->getBusNumber(), dev = fPCI->getDeviceNumber(), fn = fPCI->getFunctionNumber();
     nv_xnu_register_pci(fPCI, 0, bus, dev, fn);
     nv_xnu_register_all_pci();   // RM's chipset init needs the whole PCI tree (host bridge, root ports)
@@ -353,6 +451,31 @@ bool NVRM::start(IOService *provider)
                 setProperty("nvrm-autogo", "kernel_thread_start FAILED"); LOG("auto-go: kernel_thread_start FAILED — idle until asked");
                 releaseBootHold("no auto-go thread");
             }
+        }
+    }
+    {
+        // Join the power tree under the GPU's IOPCIDevice: on system sleep NVRM puts the GPU in standby
+        // (rm_power_management, as nvidia_suspend() does on Linux) before the slot loses power, and resumes it on wake.
+        // WAS: NVRM was not in the power tree at all; on wake NVRMFB re-lit its head on a GPU nobody had resumed and
+        // the push spun in nvEvoMakeRoom ("Darkwake Exit Failure", screen black until a hard reset).
+        // -nvrmnopm keeps the old behaviour.
+        static IOPMPowerState kNvrmPowerStates[2] = {
+            { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+            { kIOPMPowerStateVersion1, kIOPMPowerOn | kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+        };
+        char nopm[8] = { 0 };
+        if (PE_parse_boot_argn("-nvrmnopm", nopm, sizeof nopm)) {
+            setProperty("nvrm-pm", "off (-nvrmnopm)");
+            LOG("power management OFF (-nvrmnopm): system sleep will lose the GPU");
+        } else {
+            if (!gNvPmGate) gNvPmGate = IOLockAlloc();
+            PMinit();
+            fPCI->joinPMtree(this);
+            registerPowerDriver(this, kNvrmPowerStates, 2);
+            changePowerStateTo(1);
+            fPmJoined = true;
+            setProperty("nvrm-pm", "running");
+            LOG("power management: joined the power tree under %s (sleep = RM standby, wake = RM resume)", fPCI->getName());
         }
     }
     registerService();
@@ -761,7 +884,7 @@ bool NVRM::placeLargeBar1()
 {
     static const UInt64 kBigBase = 0x10000000000ULL;
     static const UInt64 kHostWindowEnd = 0x3ffbfffffffULL;
-    // -nvrmsmallbar: leave BAR1 where the firmware put it, as on a card without Resizable BAR (every GTX 16). Lets a
+    // -nvrmsmallbar: leave BAR1 where the firmware put it, as on a card without Resizable BAR (most GTX 16). Lets a
     // ReBAR card run the small-BAR paths (surface budget, copy path, private surface images) for testing and diagnosis.
     { char nb[8] = { 0 };
       if (PE_parse_boot_argn("-nvrmsmallbar", nb, sizeof nb)) { LOG("bar1: -nvrmsmallbar set — BAR1 left as IOPCIFamily placed it"); return false; } }
@@ -792,7 +915,14 @@ bool NVRM::placeLargeBar1()
     UInt64 newSize = 0;
     if (bar1Size < (4ULL << 30)) {
         for (int k = 13; k >= 12; k--) if (rbCtlOff && (rbSupported >> k) & 1) { newSize = 1ULL << (20 + k); break; }
-        if (!newSize) { LOG("bar1: BAR1 is %llu MB and the card offers no 4-8 GB size — not placing", bar1Size >> 20); return false; }
+        // Turing cards offer 64-256 MB only (sizes mask 0x1c0), and some firmware leaves them at 64 MB: a GTX 1630, a
+        // GTX 1660 SUPER and an RTX 2060 in user logs, against 66 Turing boots at 256 MB. 64 MB holds four 1440p
+        // surfaces, and the GTX 1630 at 64 MB parked console-overlapping VRAM until the park ceiling and then failed
+        // mapMemory. Take the largest size the card offers that is bigger than the current one; the placement below is
+        // the same path that moves 64 MB cards to 8 GB.
+        for (int k = 11; !newSize && k >= 0; k--)
+            if (rbCtlOff && ((rbSupported >> k) & 1) && (1ULL << (20 + k)) > bar1Size) newSize = 1ULL << (20 + k);
+        if (!newSize) { LOG("bar1: BAR1 is %llu MB and the card offers no larger size — not placing", bar1Size >> 20); return false; }
         LOG("bar1: BAR1 is %llu MB; will resize it to %llu MB", bar1Size >> 20, newSize >> 20);
         bar1Size = newSize;
     }
@@ -970,6 +1100,15 @@ void NVRM::readBARs()
 
 IOReturn NVRM::go(uint32_t pass)
 {
+    // Bringing up the GPU and the RM for the first time is an administrator
+    // operation. Was: any process that could open the user client could call
+    // sGo with any pass number. Repeating a pass that is already done is a
+    // no-op, and the userland driver runs as the logged-in user, so that path
+    // stays open deliberately.
+    if (pass > fPassDone && kauth_getuid() != 0) {
+        kprintf("NVRM-xnu: go(%u) refused: caller is not an administrator (fPassDone %d)\n", pass, fPassDone);
+        return kIOReturnNotPermitted;
+    }
     static bool gGoBusy;
     { IOLockLock(gNvClientsLock); bool busy = gGoBusy; if (!busy) gGoBusy = true; IOLockUnlock(gNvClientsLock); if (busy) { kprintf("NVRM-xnu: go(%u) refused: another go is running\n", pass); return kIOReturnBusy; } }
     struct Unbusy { ~Unbusy() { IOLockLock(gNvClientsLock); gGoBusy = false; IOLockUnlock(gNvClientsLock); } } unbusy;
@@ -980,6 +1119,7 @@ IOReturn NVRM::go(uint32_t pass)
     LOG("go(pass %u) — done so far: %u", pass, fPassDone);
     LOG("anchor: os_mem_set runtime 0x%llx (slide = runtime - its nm link address)", (unsigned long long)(uintptr_t)&os_mem_set);
     if (pass >= 1 && fPassDone < 1) {
+        char nopmArg[8] = { 0 };
         if (!gRmInitDone) {
             LOG("rm_init_rm()");
             if (!rm_init_rm(NULL)) { LOG("rm_init_rm FAILED"); return kIOReturnError; }
@@ -991,6 +1131,14 @@ IOReturn NVRM::go(uint32_t pass)
             rm_write_registry_string(NULL, NULL, "RmMsg", ":", 1);
             rm_write_registry_dword(NULL, NULL, "ResmanDebugLevel", 0);
             LOG("registry: RmMsg=\":\" ResmanDebugLevel=0 (verbose RM)");
+            if (!PE_parse_boot_argn("-nvrmnopm", nopmArg, sizeof nopmArg)) {
+                // Keep every video memory allocation over system sleep, not only RM's own: WindowServer's GPU
+                // channels (NVK through NVAccel) keep push buffers and semaphores in VRAM, and without them the
+                // compositor waited on fences forever after the first wake.
+                // RM saves them through its temporary-file interface, which os-xnu2.cpp backs with pageable kernel memory.
+                rm_write_registry_dword(NULL, NULL, "PreserveVideoMemoryAllocations", 1);
+                LOG("registry: PreserveVideoMemoryAllocations=1 (all VRAM survives system sleep)");
+            }
         }
         {
             NV_STATUS sup = rm_is_supported_device(NULL, nv);
@@ -1074,11 +1222,185 @@ void NVRM::interruptOccurred(IOInterruptEventSource *src, int count)
 
 void NVRM::stop(IOService *provider)
 {
+    if (fPmJoined) { PMstop(); fPmJoined = false; }
     if (fAdapter) { rm_shutdown_adapter(NULL, &fNv); fAdapter = false; }
     if (fIntSrc) { fIntSrc->disable(); if (fWorkLoop) fWorkLoop->removeEventSource(fIntSrc); fIntSrc->release(); fIntSrc = NULL; }
     if (fWorkLoop) { fWorkLoop->release(); fWorkLoop = NULL; }
     if (fPrivateState) { rm_free_private_state(NULL, &fNv); fPrivateState = false; }
     super::stop(provider);
+}
+
+extern "C" { void nvkms_xnu_suspend(NvU32 gpuId); void nvkms_xnu_resume(NvU32 gpuId, NvBool gpuOk); }
+
+IOReturn NVRM::setPowerState(unsigned long ordinal, IOService *device)
+{
+    const SInt32 pm = OSAddAtomic(0, &fGpuPm);
+    if (ordinal == 0 && pm == kGpuPmRunning && fAdapter) gpuSuspend();
+    else if (ordinal != 0 && pm == kGpuPmSuspended) gpuResume();
+    else LOG("power: setPowerState %lu (gpu %s, adapter %s) - nothing to do", ordinal,
+             pm == kGpuPmRunning ? "running" : pm == kGpuPmSuspended ? "suspended" : "lost", fAdapter ? "up" : "down");
+    return kIOPMAckImplied;
+}
+
+// Linux order (nvidia_suspend): NVKMS first, while the GPU still serves the core channel, then RM standby. RM saves
+// what it must keep from VRAM to system memory and unloads GSP-RM; the GPU then loses power with the slot.
+void NVRM::gpuSuspend()
+{
+    uint64_t t0 = mach_absolute_time();
+    fPmCycles++;
+    OSCompareAndSwap(kGpuPmRunning, kGpuPmSuspended, &fGpuPm);
+    setProperty("nvrm-pm", "suspended");
+    LOG("sleep #%u: suspending the GPU (NVKMS, then RM standby)", fPmCycles);
+    notifyFramebuffers(0);
+    // NVKMS first: once it is suspended no thread is inside it, so none can hold gKmsLock while it waits at the RM
+    // gate (closing the gate first deadlocked against an NVKMS ioctl calling into RM).
+    nvkms_xnu_suspend(fNv.gpu_id);
+    const int busy = nv_xnu_pm_close(10000);
+    if (busy) LOG("sleep #%u: %d RM call(s) still running after 10 s - suspending anyway", fPmCycles, busy);
+    // nv_preempt_user_channels(): with every VRAM allocation preserved, user channels must be idle and stopped
+    // while their memory is copied out, and restarted once it is back.
+    NV_STATUS cst = rm_stop_user_channels(NULL, &fNv);
+    pciSaveForSleep();
+    NV_STATUS st = rm_power_management(NULL, &fNv, NV_PM_ACTION_STANDBY);
+    if (fIntSrc) fIntSrc->disable();
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    LOG("sleep #%u: user channels stopped -> 0x%x; rm_power_management(STANDBY) -> 0x%x in %llu ms%s", fPmCycles,
+        (unsigned)cst, (unsigned)st, ns / 1000000ULL, st == NV_OK ? "" : " - resume will still be tried, as on Linux");
+}
+
+// The slot is powered again and IOPCIFamily restored the config space it shadowed. Put back what it does not know
+// (the resized BAR1 and the root port window placeLargeBar1 set), check the GPU answers, then RM resume (GSP boots
+// again through FSP) and NVKMS resume. The framebuffers re-light their heads when told the GPU is back.
+void NVRM::gpuResume()
+{
+    uint64_t t0 = mach_absolute_time();
+    LOG("wake #%u: resuming the GPU", fPmCycles);
+    nv_xnu_pm_take();
+    bool ok = pciRestoreAfterWake() && gpuAnswers();
+    if (fIntSrc) fIntSrc->enable();
+    NV_STATUS st = ok ? rm_power_management(NULL, &fNv, NV_PM_ACTION_RESUME) : NV_ERR_GPU_IS_LOST;
+    ok = st == NV_OK;
+    NV_STATUS cst = ok ? rm_restart_user_channels(NULL, &fNv) : NV_ERR_GPU_IS_LOST;   // nv_restore_user_channels()
+    OSCompareAndSwap(kGpuPmSuspended, ok ? kGpuPmRunning : kGpuPmLost, &fGpuPm);
+    nvkms_xnu_resume(fNv.gpu_id, ok);
+    nv_xnu_pm_open();   // also when lost: RM then answers the waiting calls with errors instead of leaving them blocked
+    setProperty("nvrm-pm", ok ? "running" : "lost (resume failed)");
+    uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    LOG("wake #%u: rm_power_management(RESUME) -> 0x%x, user channels restarted -> 0x%x, %llu ms - %s", fPmCycles,
+        (unsigned)st, (unsigned)cst, ns / 1000000ULL,
+        ok ? "GPU running, telling the framebuffers" : "GPU LOST: NVKMS refuses all display work until a restart");
+    notifyFramebuffers(ok ? 1 : 2);
+}
+
+void NVRM::pciSaveForSleep()
+{
+    PciSave &s = fPciSave;
+    s = {};
+    s.cmd = fPCI->configRead16(0x04);
+    for (unsigned i = 0; i < 6; i++) s.bar[i] = fPCI->configRead32(0x10 + i * 4);
+    for (UInt32 off = 0x100, n = 0; off >= 0x100 && off < 0x1000 && n < 64; n++) {
+        UInt32 h = fPCI->extendedConfigRead32(off);
+        if (h == 0 || h == 0xffffffffU) break;
+        if ((h & 0xffff) == 0x15) {   // Resizable BAR: IOPCIFamily does not restore the sizes
+            UInt32 nbars = (fPCI->extendedConfigRead32(off + 8) >> 5) & 7;
+            for (UInt32 i = 0; i < nbars && i < 6; i++) { s.rbOff[i] = off + 8 + i * 8; s.rbCtl[i] = fPCI->extendedConfigRead32(s.rbOff[i]); }
+            s.rbCount = nbars < 6 ? nbars : 6;
+            break;
+        }
+        off = h >> 20;
+    }
+    IOService *pp = fPCI->getProvider();
+    s.rp = pp ? OSDynamicCast(IOPCIDevice, pp->getProvider()) : NULL;
+    if (s.rp) {
+        s.rpCmd = s.rp->configRead16(0x04);
+        for (unsigned i = 0; i < 6; i++) s.rpWin[i] = s.rp->configRead32(0x18 + i * 4);
+    }
+    s.valid = true;
+    LOG("sleep: saved config - cmd 0x%04x BAR1 0x%08x%08x, %u ReBAR control(s), root port %s pref 0x%08x %08x/%08x",
+        s.cmd, s.bar[2], s.bar[1] & ~0xFU, s.rbCount, s.rp ? s.rp->getName() : "(none)", s.rpWin[3], s.rpWin[4], s.rpWin[5]);
+}
+
+bool NVRM::pciRestoreAfterWake()
+{
+    PciSave &s = fPciSave;
+    if (!s.valid) { LOG("wake: no saved config - leaving what IOPCIFamily restored"); return true; }
+    if (fPCI->configRead16(0x00) != 0x10de) { LOG("wake: config space answers vendor 0x%04x - the GPU is not on the bus", fPCI->configRead16(0x00)); return false; }
+    unsigned fixed = 0;
+    if (s.rp) {
+        bool winDiff = false;
+        for (unsigned i = 0; i < 6; i++) {
+            // 0x1c's upper half is the Secondary Status register (write-1-to-clear error bits), not a window
+            const UInt32 mask = i == 1 ? 0x0000ffffU : 0xffffffffU;
+            UInt32 cur = s.rp->configRead32(0x18 + i * 4);
+            if ((cur ^ s.rpWin[i]) & mask) { LOG("wake: root port @0x%02x is 0x%08x, was 0x%08x", 0x18 + i * 4, cur, s.rpWin[i]); winDiff = true; }
+        }
+        if (winDiff) {   // same order as placeLargeBar1: close the prefetchable window, set the upper halves, reopen it
+            s.rp->configWrite32(0x18, s.rpWin[0]); s.rp->configWrite16(0x1c, (UInt16)s.rpWin[1]); s.rp->configWrite32(0x20, s.rpWin[2]);
+            s.rp->configWrite32(0x24, 0x0000fff0);
+            s.rp->configWrite32(0x28, s.rpWin[4]); s.rp->configWrite32(0x2c, s.rpWin[5]);
+            s.rp->configWrite32(0x24, s.rpWin[3]);
+            fixed++;
+        }
+        UInt16 rc = s.rp->configRead16(0x04);
+        if ((rc & 0x6) != (s.rpCmd & 0x6)) { s.rp->configWrite16(0x04, rc | (s.rpCmd & 0x6)); fixed++; }
+    }
+    bool gpuDiff = false;
+    for (unsigned i = 0; i < s.rbCount; i++) {
+        UInt32 cur = fPCI->extendedConfigRead32(s.rbOff[i]);
+        if ((cur & 0x3f00) != (s.rbCtl[i] & 0x3f00)) { LOG("wake: ReBAR control @0x%x is 0x%08x, was 0x%08x", s.rbOff[i], cur, s.rbCtl[i]); gpuDiff = true; }
+    }
+    for (unsigned i = 0; i < 6; i++) {
+        UInt32 cur = fPCI->configRead32(0x10 + i * 4);
+        if (cur != s.bar[i]) { LOG("wake: BAR register @0x%02x is 0x%08x, was 0x%08x", 0x10 + i * 4, cur, s.bar[i]); gpuDiff = true; }
+    }
+    if (gpuDiff) {   // PCIe 7.8.6: resize only while memory decode is off; the BARs follow the new sizes
+        UInt16 cmd = fPCI->configRead16(0x04);
+        fPCI->configWrite16(0x04, cmd & ~0x2);
+        for (unsigned i = 0; i < s.rbCount; i++) fPCI->extendedConfigWrite32(s.rbOff[i], s.rbCtl[i]);
+        for (unsigned i = 0; i < 6; i++) fPCI->configWrite32(0x10 + i * 4, s.bar[i]);
+        fixed++;
+    }
+    UInt16 cmd = fPCI->configRead16(0x04);
+    if ((cmd & 0x6) != (s.cmd & 0x6)) fPCI->configWrite16(0x04, cmd | (s.cmd & 0x6));
+    bool ok = true;
+    for (unsigned i = 0; i < s.rbCount; i++)
+        if ((fPCI->extendedConfigRead32(s.rbOff[i]) & 0x3f00) != (s.rbCtl[i] & 0x3f00)) ok = false;
+    for (unsigned i = 0; i < 6; i++) if (fPCI->configRead32(0x10 + i * 4) != s.bar[i]) ok = false;
+    LOG("wake: config %s (%u fix-up(s)), command 0x%04x", ok ? "matches the pre-sleep state" : "does NOT read back as saved", fixed, fPCI->configRead16(0x04));
+    return ok;
+}
+
+bool NVRM::gpuAnswers()
+{
+    if (fNv.bars[0].size < 0x1000) return true;
+    IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)fNv.bars[0].cpu_address, 0x1000, kIODirectionInOut);
+    IOMemoryMap *map = md ? md->map(kIOMapInhibitCache) : NULL;
+    UInt32 boot0 = map ? *(volatile UInt32 *)map->getVirtualAddress() : 0xffffffffU;
+    OSSafeReleaseNULL(map); OSSafeReleaseNULL(md);
+    const bool ok = boot0 != 0xffffffffU && boot0 != 0;
+    LOG("wake: PMC_BOOT_0 = 0x%08x - %s", boot0, ok ? "the GPU answers" : "the GPU does not answer");
+    return ok;
+}
+
+// state 0: the GPU goes to standby (NVKMS turns every head off); 1: resumed, re-light; 2: lost.
+void NVRM::notifyFramebuffers(uintptr_t state)
+{
+    const OSSymbol *fn = OSSymbol::withCString("NVRMGpuPower");
+    OSIterator *nubs = getChildIterator(gIOServicePlane);
+    unsigned told = 0;
+    while (fn && nubs) {
+        IOService *nub = OSDynamicCast(IOService, nubs->getNextObject());
+        if (!nub) break;
+        OSIterator *fbs = nub->getChildIterator(gIOServicePlane);
+        while (fbs) {
+            IOService *fb = OSDynamicCast(IOService, fbs->getNextObject());
+            if (!fb) break;
+            if (fb->callPlatformFunction(fn, false, (void *)state, NULL, NULL, NULL) == kIOReturnSuccess) told++;
+        }
+        OSSafeReleaseNULL(fbs);
+    }
+    OSSafeReleaseNULL(nubs); OSSafeReleaseNULL(fn);
+    LOG("power: told %u framebuffer(s) the GPU is %s", told, state == 0 ? "going to standby" : state == 1 ? "back" : "lost");
 }
 
 #undef super
@@ -1114,6 +1436,10 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         NvU32 *percent = (NvU32 *)p1; if (!percent) return kIOReturnBadArgument;
         return nvkms_xnu_backlight(p2 != NULL, percent) ? kIOReturnSuccess : kIOReturnNotFound;
     }
+    if (fn && fn->isEqualTo("NVRMGpuReady"))         // NVRMFB: may the display engine be touched (not in system sleep)?
+        return OSAddAtomic(0, &fGpuPm) == kGpuPmRunning ? kIOReturnSuccess : kIOReturnNotReady;
+    if (fn && fn->isEqualTo("NVRMGpuPower"))         // sent down to the framebuffers; an older NVRMFB passes it back up
+        return kIOReturnUnsupported;
     if (fn && fn->isEqualTo("NVRMBootScreenDone")) {
         if (fBootScreen) { fBootScreen->release(); fBootScreen = nullptr; LOG("boot screen: buffer released after the takeover"); }
         return kIOReturnSuccess;
@@ -1135,6 +1461,9 @@ IOReturn NVRM::callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, voi
         return kIOReturnSuccess;
     }
     if (fn && p1) {
+        const bool rmCall = fn->isEqualTo(NVRM_GPUVA_FN_ALLOC) || fn->isEqualTo(NVRM_GPUVA_FN_MAP) || fn->isEqualTo(NVRM_GPUVA_FN_FREE)
+                         || fn->isEqualTo(NVRM_SS_FN_RM) || fn->isEqualTo(NVRM_SS_FN_PAGEOFF);
+        NvXnuPmUse pmUse(rmCall);
         struct NVRMGpuVaRequest *g = (struct NVRMGpuVaRequest *)p1;
         if (fn->isEqualTo(NVRM_GPUVA_FN_ALLOC))
             return nvrm_gpuva_alloc(g) ? kIOReturnIOError : kIOReturnSuccess;
@@ -1159,13 +1488,43 @@ bool NVRMUserClient::start(IOService *provider)
 bool NVRMUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
 {
     if (!super::initWithTask(owningTask, securityID, type, properties)) return false;
+    // The user-client type came from user space and anything non-zero silently became a device
+    // client, so a bogus type (0x4841, etc.) opened a working device client. Only two types exist:
+    // 0 = ctl (escalated RM state), 1 = device. Refuse anything else rather than treating it as a
+    // device client. The ctl client stays open to unprivileged callers on purpose -- the Vulkan
+    // userland opens it as the logged-in user -- and the escalated operations behind it are gated
+    // by the real-privilege check in _os_is_administrator and the root requirement on first init.
+    if (type > 1) return false;
     fIsCtl = (type == 0);
     nvu_memset(&fNvfp, 0, sizeof fNvfp);
     fNvfp.ctl_nvfp_priv = this;
     if (!gNvClientsLock) gNvClientsLock = IOLockAlloc();
+    // One table serves every process, so one process (or one user's processes) could fill it and leave WindowServer
+    // unable to open a client. Two limits: a process holds at most kNvClientsPerPid (the busiest process measured on
+    // a desktop held 154: Maps; Firefox's GPU process 96, WindowServer 78), and the last kNvClientsReserved slots
+    // are kept for system accounts (uid < 500: root and _windowserver), so the desktop can always open one.
+    static const int kNvClientsPerPid = 4096, kNvClientsReserved = 4096;
+    const int pid = proc_selfpid();
+    const bool systemCaller = kauth_getuid() < 500;
+    int used = 0, mine = 0, slot = -1;
     IOLockLock(gNvClientsLock);
-    for (int i = 0; i < NV_XNU_MAX_CLIENTS; i++) if (!gNvClients[i]) { gNvClients[i] = this; fFd = i; break; }
+    for (int i = 0; i < NV_XNU_MAX_CLIENTS; i++) {
+        NVRMUserClient *k = gNvClients[i];
+        if (!k) { if (slot < 0) slot = i; continue; }
+        used++;
+        if (k->fPid == pid) mine++;
+    }
+    const bool overPid = mine >= kNvClientsPerPid;
+    const bool overShared = !systemCaller && used >= NV_XNU_MAX_CLIENTS - kNvClientsReserved;
+    if (slot >= 0 && !overPid && !overShared) { gNvClients[slot] = this; fFd = slot; }
     IOLockUnlock(gNvClientsLock);
+    if (overPid || overShared) {
+        static unsigned quotaLogged;
+        if (quotaLogged < 8) { quotaLogged++;
+            kprintf("NVRM-xnu: client refused for pid %d: %s (%d held by this process, %d of %d in use)\n", pid,
+                    overPid ? "per-process limit" : "slots reserved for system accounts", mine, used, NV_XNU_MAX_CLIENTS); }
+        return false;
+    }
     if (fFd < 0) {
         static unsigned tableFullLogged;
         if (tableFullLogged < 8) { tableFullLogged++;
@@ -1186,7 +1545,7 @@ IOReturn NVRMUserClient::clientClose(void)
         fCleaned = true;
         if (gNvClientsLock && fFd >= 0) { IOLockLock(gNvClientsLock); gNvClients[fFd] = NULL; nv_pm_close(fPm); IOLockUnlock(gNvClientsLock); }
         if (fKms) { nvkms_xnu_close(fKms); fKms = nullptr; }
-        if (fOwner) rm_cleanup_file_private(NULL, nvState(), &fNvfp);
+        if (fOwner) { NvXnuPmUse pmUse; rm_cleanup_file_private(NULL, nvState(), &fNvfp); }
         if (fMmap.memArea.pRanges) { kern_os_free(fMmap.memArea.pRanges); fMmap.memArea.pRanges = NULL; }
         if (nv_xnu_chat()) kprintf("NVRM-xnu: client fd %d closed\n", fFd);
     }
@@ -1214,7 +1573,7 @@ IOReturn NVRMUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
     } else {
         NvU64 n = c->memArea.numRanges;
         if (n == 1 && !nv_pm_is_gpu(c->memArea.pRanges[0].start, c->memArea.pRanges[0].size)) {
-            md = nv_pm_ram_submd(c->memArea.pRanges[0].start, c->memArea.pRanges[0].size);
+            md = nv_pm_ram_submd(c->memArea.pRanges[0].start, c->memArea.pRanges[0].size, fPid);
             if (!md) return kIOReturnNotPermitted;
         } else if (n == 1) {
             md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)c->memArea.pRanges[0].start, (IOByteCount)c->memArea.pRanges[0].size, kIODirectionInOut);
@@ -1259,6 +1618,11 @@ IOReturn NVRMUserClient::sKms(OSObject *target, void *reference, IOExternalMetho
 {
     NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
     if (!me || !me->fOwner) return kIOReturnNotAttached;
+    // The session this opens is an NVKMS kernel-space client, and NVKMS trusts a kernel client's embedded pointers
+    // (flip heads, LUT ramps, clip lists) as kernel addresses. Nothing the driver ships calls this: the display path
+    // reaches NVKMS through its in-kernel API and the Vulkan driver never uses this selector. So it is root-only;
+    // an unprivileged caller would otherwise hand NVKMS pointers it dereferences in the kernel.
+    if (kauth_getuid() != 0) return kIOReturnNotPrivileged;
     uint32_t cmd = (uint32_t)args->scalarInput[0];
     uint32_t size = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() : args->structureInputSize;
     if (size == 0 || size > (1u << 20)) return kIOReturnBadArgument;
@@ -1288,6 +1652,7 @@ IOReturn NVRMUserClient::sKmsEvents(OSObject *target, void *reference, IOExterna
 {
     NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
     if (!me) return kIOReturnNotAttached;
+    if (kauth_getuid() != 0) return kIOReturnNotPrivileged;   // the NVKMS session sKms opens is root-only
     args->scalarOutput[0] = nvkms_xnu_events_available(me->fKms);
     return kIOReturnSuccess;
 }
@@ -1307,7 +1672,12 @@ NVRMUserClient *NVRMUserClient::fromNvfp(nv_file_private_t *p)
     return c->fEvtMagic == 0x4e564556u ? c : NULL;
 }
 #pragma clang diagnostic pop
-static volatile SInt64 gNvEvtPosts = 0, gNvEvtMatched = 0, gNvEvtWaits = 0, gNvEvtSlept = 0;
+// Live count of callers parked in sWaitEvent, and the ceiling. Was: no cap,
+// so N processes parked N kernel threads. 256 is far above what the driver
+// itself uses (one waiter per active client) and far below a thread count
+// that matters to the system.
+static volatile SInt32 gNvEvtSleepers = 0;
+static const SInt32 kNvEvtMaxSleepers = 256;
 extern "C" void NV_API_CALL nv_post_event(nv_event_t *event, NvHandle hEvent, NvU32 index, NvU32 info32, NvU16 info16, NvBool data_valid)
 {
     const SInt64 k = OSIncrementAtomic64(&gNvEvtPosts);
@@ -1329,10 +1699,19 @@ IOReturn NVRMUserClient::sWaitEvent(OSObject *target, void *reference, IOExterna
     uint64_t us = args->scalarInput[1]; if (us > 100000) us = 100000;
     OSIncrementAtomic64(&gNvEvtWaits);
     if (us && me->fEvtSeq == seen) {
-        assert_wait_timeout((event_t)&me->fEvtSeq, THREAD_ABORTSAFE, (uint32_t)us, NSEC_PER_USEC);
-        if (me->fEvtSeq != seen) thread_wakeup((event_t)&me->fEvtSeq);
-        OSIncrementAtomic64(&gNvEvtSlept);
-        (void)thread_block(THREAD_CONTINUE_NULL);
+        // OSIncrementAtomic returns the value before the increment.
+        if (OSIncrementAtomic(&gNvEvtSleepers) >= kNvEvtMaxSleepers) {
+            // At the ceiling: return the current sequence without parking. This
+            // is the same answer a timeout gives, so no caller can observe a
+            // result it could not already have seen.
+            OSDecrementAtomic(&gNvEvtSleepers);
+        } else {
+            assert_wait_timeout((event_t)&me->fEvtSeq, THREAD_ABORTSAFE, (uint32_t)us, NSEC_PER_USEC);
+            if (me->fEvtSeq != seen) thread_wakeup((event_t)&me->fEvtSeq);
+            OSIncrementAtomic64(&gNvEvtSlept);
+            (void)thread_block(THREAD_CONTINUE_NULL);
+            OSDecrementAtomic(&gNvEvtSleepers);
+        }
     }
     args->scalarOutput[0] = me->fEvtSeq;
     return kIOReturnSuccess;
@@ -1341,8 +1720,19 @@ IOReturn NVRMUserClient::sBindFd(OSObject *target, void *reference, IOExternalMe
 {
     NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
     if (!me) return kIOReturnNotAttached;
-    me->fBound = (int)args->scalarInput[0];
+    // The value is a file descriptor number, or a negative number meaning "detached": the userland driver
+    // detaches a connection it is about to pool or keep alive by binding it to -2, sign-extended to 64 bits.
+    // Anything else outside the 32-bit signed range is a caller error, not something to store and look up
+    // later. Refusing the detach value left the connection bound to an fd number the process then reused, so
+    // two connections answered for one fd and the Vulkan device in WindowServer could not be created.
+    const int64_t v = (int64_t)args->scalarInput[0];
+    if (v > 0x7FFFFFFFLL || v < -0x80000000LL) return kIOReturnBadArgument;
+    me->fBound = (int)v;
     me->fEverBound = true;
+    // A stale mapping context is cleared when the connection is bound to a real fd, the only point where it
+    // could be used for a new mapping. Not on detach (a negative value): the userland driver detaches a
+    // connection it keeps alive for mappings that are still live, and clearing the context there left those
+    // mappings unreleasable, so VRAM filled up and stayed full after the process exited.
     if (me->fBound >= 0 && me->fMmap.valid) {
         kprintf("NVRM-xnu: client %d re-bound to fd %d with a stale mapping context - cleared\n", me->fFd, me->fBound);
         nvMmapContextClear(&me->fMmap);
@@ -1381,6 +1771,7 @@ IOReturn NVRMUserClient::esc(uint32_t cmd, void *data, uint32_t size)
 {
     if (!fOwner || fOwner->fPassDone < 2) { static bool once; if (!once) { once = true; kprintf("NVRM-xnu: esc 0x%x refused: adapter not up (run nvrmctl go 2)\n", cmd); } return kIOReturnNotReady; }
     nv_state_t *nv = nvState();
+    NvXnuPmUse pmUse;
     switch (cmd) {
     case NV_ESC_CARD_INFO: {
         if (!fIsCtl) return kIOReturnBadArgument;
@@ -1428,6 +1819,9 @@ IOReturn NVRMUserClient::sGo(OSObject *target, void *reference, IOExternalMethod
 {
     NVRMUserClient *me = OSDynamicCast(NVRMUserClient, target);
     if (!me || !me->fOwner) return kIOReturnNotAttached;
+    // Starting the GPU's passes by hand is for root only (security report #214, finding 5: any process could force a
+    // GPU re-init). The driver starts itself at boot (autoGo); nothing a user runs needs this.
+    if (!kauth_cred_issuser(kauth_cred_get())) return kIOReturnNotPrivileged;
     return me->fOwner->go((uint32_t)args->scalarInput[0]);
 }
 
