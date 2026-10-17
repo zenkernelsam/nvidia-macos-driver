@@ -1,5 +1,89 @@
 # Changelog
 
+## 2.3.1
+
+Safer updates
+- If an update cannot bring your display up, your Mac no longer stays on a black screen. After two starts in a row
+  that never reached the display, the driver turns itself off so macOS still starts, and the driver you had before the
+  update is put back automatically with one restart. Nothing stays running once an update has worked
+- Releases now also have to pass app checks on the new Metal driver (Terminal text, window capture) and may not do
+  worse than the release before
+
+## 2.3.0
+
+Fixes
+- Plugging a different monitor into the same port: macOS sees the new monitor (its name, size and modes) instead
+  of keeping the one it replaced
+- Terminal and other apps that draw text with programmable blending: text no longer comes out missing or garbled
+  (GTX 16 and others). Draws that read colour from a pass without every attachment were skipped; they are now drawn,
+  and overlapping triangles in one draw read each other's colour in order (thanks pengubow)
+- Above 60 Hz: the display and the accelerator woke up once per millisecond to check for a finished flip, which
+  users' flicker recordings showed as about 56 flips a second on a 143 Hz panel while windows moved. They now wake on
+  the flip itself (the display on macOS 15 and 26, the accelerator on macOS 26)
+- When a display's mode set is refused, the driver now tries the mode the firmware is already running before giving
+  up, and the log says why the mode was refused (reports of a black screen at login on some RTX 3060 boards)
+- Draws the Metal driver had to drop are now in the logs that Send logs collects
+
+AMD / Intel test program
+- 1401 can join the AMD and Intel GPU test program (AMD/Intel panel, Join). Testers get the newest signed test build
+  of the AMD/Intel driver, and after every restart 1401 sends what the driver did, so a start that hangs or panics
+  still reaches us. Leave the program from the same panel at any time
+
+## 2.2.0
+
+This release makes the driver do one thing: drive NVIDIA GPUs. Everything else it used to carry is now its own
+product or is gone, which makes the package smaller, leaves less running on your Mac, and leaves less to go wrong.
+
+Leaner
+- The package carries the NVIDIA driver only: the AMD/Intel GPU driver, the NPU driver and the audio driver are
+  separate products with their own packages and installers (the package drops from about 1 GB)
+- The boot logo is gone: the OpenCore logo driver, the boot progress screen and the display driver's code that kept
+  the logo on screen. Installing, updating or removing the driver takes an existing logo out of OpenCore
+- Three background jobs are gone: a display tracker that streamed the driver's log all the time, a WindowServer
+  restart at every boot (a flicker workaround from before the flicker fix in 2.1.0), and a crash-check login item.
+  Logs are collected only when you press Send logs. Installing or removing the driver takes out what an earlier
+  version left
+- The 1401 Mac app moved to the 1401 project; it installs this driver with the package's own installer
+
+Fixes
+- A display whose firmware boot timing NVIDIA's display code does not accept (seen on an RTX 3060 at 1920x1080) now
+  switches to the validated timing for the same resolution instead of crashing WindowServer at login
+- Checksum lists are checked strictly: a malformed line in SHA256SUMS used to be skipped while the check still passed
+- install.sh fixes PATH before running anything as root, like uninstall.sh
+- Crash reports sent with Send logs keep the library identifiers needed to read them (machine identifiers are still
+  removed)
+
+## 2.1.0
+
+Driver
+- Each GPU generation (GTX 16, RTX 20, 30, 40 and 50) is now described by the card itself: the driver reads the
+  architecture and the newest engine classes from the GPU and publishes them, and the Metal driver picks the video
+  decoder and the scan-out model from that instead of a table of device IDs
+- Cards with a small BAR1 (Resizable BAR off, or a board that does not offer it): the driver moves BAR1 away from the
+  boot screen at its own size, so GTX 16 / Turing cards get the same zero-copy display path as the others. A BAR1 that
+  macOS left unassigned is reported instead of failing with no reason
+- The desktop no longer waits for the GPU on every frame (#196): each window the compositor draws is marked when the
+  GPU finishes it, and the display waits only for that mark
+- A BAR1 the firmware already placed large is left as it is, and the old setup comes back if a resize fails
+- Gamma tables are applied; HiDPI desktop modes can be turned on with nvfbhidpi
+- The installer keeps your own settings block in nvrm610.conf
+
+Metal
+- Blender: Eevee renders lit scenes. NVIDIA GPUs cannot write the stencil value from a shader, which Blender's Metal
+  backend relies on to sort its lighting; the driver now rebuilds that value by drawing once per stencil bit. Also
+  fixed: a light loop that hung the GPU (the first active SIMD lane, and loop values lost when helpers were inlined),
+  render passes with no attachments, layered 3D colour targets, framebuffer fetch, samplers held in argument buffers,
+  and image atomics in helper functions. Blender's shadow pages no longer crash it
+- Indirect compute dispatches read their grid size on the GPU instead of stopping to read it on the CPU
+- Hardware video decoders are registered with macOS's decode service (#175)
+
+AMD / Intel test driver
+- The log now says which driver started, which PCI drivers registered and which device each one matched, so a GPU
+  no driver took can be traced from a user's log
+
+Mac app
+- Map my GPU (experimental, opt-in)
+
 ## 2.0.4
 
 Mac app

@@ -1,5 +1,7 @@
 #!/bin/bash
 set -u
+# runs as root: tools resolve through a fixed PATH, never one the caller exported
+PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH
 HERE=$(cd "$(dirname "$0")" && pwd)
 if [ "${1:-}" = --payload ]; then
   [ "$#" = 2 ] && [ -d "$2" ] || { echo "STOP: --payload requires an existing package directory" >&2; exit 2; }
@@ -150,7 +152,8 @@ CARD=""; for i in $NV_IDS; do case " $(echo $SUPPORTED_IDS) " in *" $i "*) CARD=
 ok "macOS $v, x86_64, NVIDIA GPU present"
 
 step "2. package integrity"
-(cd "$HERE" && shasum -a 256 -c SHA256SUMS --quiet) || die "SHA256SUMS mismatch: re-download the package"
+# --strict: without it shasum skips a malformed line and still reports success
+(cd "$HERE" && shasum -a 256 --strict -c SHA256SUMS --quiet) || die "SHA256SUMS mismatch: re-download the package"
 for target in 15 26; do
   [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/MacOS/NVAccel" ] && \
     [ -f "$HERE/Library/NullMoth/kexts/$target/NVAccel.kext/Contents/Info.plist" ] || die "this package lacks the complete macOS $target accelerator"
@@ -225,50 +228,12 @@ INSTALLING=1; [ "${CHECK:-0}" = 1 ] || : > "$LOCKDIR/installing"
 for k in $KEXTS; do rm -rf "$EXT/$k.kext" && ditto "$(kpath $k)" "$EXT/$k.kext" || die "copy $k (restore from $BK)"; done
 # both NVAccel builds stay on disk, so the first start after a macOS upgrade can switch to the matching one
 mkdir -p /Library/NullMoth && rm -rf /Library/NullMoth/kexts && ditto "$HERE/Library/NullMoth/kexts" /Library/NullMoth/kexts || die "copy per-macOS accelerators (restore from $BK)"
-# the AMD/Intel Vulkan drivers under the Metal plugin (RADV, ANV, libdrm), cached for setup --gpu-test like NMXGPU
-if [ -d "$HERE/Library/NullMoth/gpu-userland" ]; then
-  rm -rf /Library/NullMoth/gpu-userland && ditto "$HERE/Library/NullMoth/gpu-userland" /Library/NullMoth/gpu-userland || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
-fi
-# the NPU userland (Level Zero + Intel's NPU driver and compiler, OpenVINO, AMD's XRT), loaded from /Library/NullMoth/npu
-# by apps. AMD's validation archives in xrt/share/amdxdna/bins were fetched by setup for this Mac's NPU and are not in
-# the package, so they are carried over the replacement.
-if [ -d "$HERE/Library/NullMoth/npu" ]; then
-  NPUKEEP=""
-  if [ -d /Library/NullMoth/npu/xrt/share/amdxdna/bins ]; then
-    NPUKEEP=$(mktemp -d /private/var/tmp/nullmoth-npu-bins.XXXXXX) && ditto /Library/NullMoth/npu/xrt/share/amdxdna/bins "$NPUKEEP" \
-      || die "keep the NPU validation archives (restore from $BK)"
-  fi
-  rm -rf /Library/NullMoth/npu && ditto "$HERE/Library/NullMoth/npu" /Library/NullMoth/npu && chmod -R go-w,a+rX /Library/NullMoth/npu \
-    || die "copy the NPU userland (restore from $BK)"
-  if [ -n "$NPUKEEP" ]; then
-    mkdir -p /Library/NullMoth/npu/xrt/share/amdxdna && ditto "$NPUKEEP" /Library/NullMoth/npu/xrt/share/amdxdna/bins \
-      && chmod -R go-w,a+rX /Library/NullMoth/npu/xrt/share/amdxdna/bins && rm -rf "$NPUKEEP" \
-      || die "restore the NPU validation archives from $NPUKEEP"
-  fi
-fi
 for target in 15 26; do
   dir=/Library/NullMoth/kexts/$target
   [ -f "$dir/NVAccel.kext/Contents/MacOS/NVAccel" ] && [ -f "$dir/NVAccel.kext/Contents/Info.plist" ] || die "missing macOS $target accelerator (restore from $BK)"
   (cd "$dir" && find NVAccel.kext -type f -exec shasum -a 256 '{}' \;) > "$dir/SHA256SUMS" || die "cache manifest for macOS $target"
 done
 chown -R root:wheel /Library/NullMoth/kexts && chmod -R go-w /Library/NullMoth/kexts || die "cached accelerator permissions"
-# the AMD/Intel GPU driver (opt-in, setup --gpu-test): when it is on, an update brings its new build along. The cached
-# copy is under the running macOS: NMXGPU and NMXNPU are the same binaries on 15 and 26 (like NVRM), but NMXAccel is
-# built per-OS (it inherits IOAcceleratorFamily2, which Tahoe privatised - see kexts/NVRM/accel/gen_tahoe_fwd.py).
-if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/kexts/$MAJ/NMXGPU.kext ]; then
-  rm -rf "$EXT/NMXGPU.kext" && ditto /Library/NullMoth/kexts/$MAJ/NMXGPU.kext "$EXT/NMXGPU.kext" && chown -R root:wheel "$EXT/NMXGPU.kext" \
-    && chmod -R 755 "$EXT/NMXGPU.kext" || die "refresh the AMD/Intel GPU driver (restore from $BK)"
-  # and its Metal accelerator
-  if [ -d /Library/NullMoth/kexts/$MAJ/NMXAccel.kext ]; then
-    rm -rf "$EXT/NMXAccel.kext" && ditto /Library/NullMoth/kexts/$MAJ/NMXAccel.kext "$EXT/NMXAccel.kext" && chown -R root:wheel "$EXT/NMXAccel.kext" \
-      && chmod -R 755 "$EXT/NMXAccel.kext" || die "refresh the AMD/Intel Metal accelerator (restore from $BK)"
-  fi
-  # and the NPU driver, where it was turned on
-  if [ -d "$EXT/NMXNPU.kext" ] && [ -d /Library/NullMoth/kexts/$MAJ/NMXNPU.kext ]; then
-    rm -rf "$EXT/NMXNPU.kext" && ditto /Library/NullMoth/kexts/$MAJ/NMXNPU.kext "$EXT/NMXNPU.kext" && chown -R root:wheel "$EXT/NMXNPU.kext" \
-      && chmod -R 755 "$EXT/NMXNPU.kext" || die "refresh the NPU driver (restore from $BK)"
-  fi
-fi
 echo "$MAJ" > /Library/NullMoth/os-major || die "record selected OS"
 mkdir -p "$GB" "$FW" || die "create bundle and firmware directories"
 # $GB/nvmtl is replaced wholesale below, so move the shared shader caches aside first. NVMTLLibraryLoad.m
@@ -279,8 +244,19 @@ CACHEKEPT=""
 for c in aircache spvcache; do
   [ ! -d "$GB/nvmtl/$c" ] || { mv "$GB/nvmtl/$c" "$T/keep-$c" && CACHEKEPT="$CACHEKEPT $c" || die "stash $GB/nvmtl/$c"; }
 done
+# A user's own settings survive updates: the lines between these two markers in nvrm610.conf are put back after the
+# copy below. An RTX 3050 (GA106, GH #130) ran only with NVMTL_NO_SURFACE_PAGEOFF=1 and uncached command pools, and every
+# update wrote the file fresh and dropped them. Only driver knobs (NVMTL_/NVK_/NVRM_ with plain values) are kept.
+MYCONF_START='# --- my settings, kept on update ---'; MYCONF_END='# --- end my settings ---'
+[ ! -f "$GB/nvmtl/nvrm610.conf" ] || sed -n "/^$MYCONF_START\$/,/^$MYCONF_END\$/p" "$GB/nvmtl/nvrm610.conf" \
+  | grep -E "^($MYCONF_START|$MYCONF_END|(NVMTL|NVK|NVRM)_[A-Z0-9_]+=[A-Za-z0-9._-]{0,64})\$" > "$T/my-conf" || : > "$T/my-conf"
 for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl; do rm -rf "$GB/$b" && ditto "$HERE/Library/GPUBundles/$b" "$GB/$b" || die "copy $b (restore from $BK)"; done
-# nvmtl was just replaced wholesale: with the AMD/Intel driver on, its Vulkan drivers go back in beside NVK
+if [ -s "$T/my-conf" ] && [ -f "$GB/nvmtl/nvrm610.conf" ]; then
+  cat "$T/my-conf" >> "$GB/nvmtl/nvrm610.conf" || die "keep your settings in nvrm610.conf (restore from $BK)"
+  ok "kept your settings in nvrm610.conf ($(grep -cvE '^#' "$T/my-conf") line(s))"
+fi
+# nvmtl was just replaced wholesale: when the separate AMD/Intel driver is installed, its Vulkan drivers (which its
+# own installer put in /Library/NullMoth/gpu-userland) go back in beside NVK
 if [ -d "$EXT/NMXGPU.kext" ] && [ -d /Library/NullMoth/gpu-userland ]; then
   ditto /Library/NullMoth/gpu-userland "$GB/nvmtl" || die "copy the AMD/Intel Vulkan drivers (restore from $BK)"
 fi
@@ -330,6 +306,58 @@ step "6. boot-args"
 # A remove flag left by a boot-picker removal that did not finish keeps every NullMoth kext off at boot. Installing
 # again means the driver is wanted, so the flag goes; the boot picker sets it again when it is chosen.
 nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-remove 2>/dev/null || true
+
+step "6b. falling back to the previous driver if this one cannot start"
+# The kernel's boot guard (nvrm_off.h) turns the driver off after two starts in a row that never brought the display
+# up, so the Mac reaches a desktop on the firmware's framebuffer. This one-shot job then puts the previous driver back
+# from this install's backup and restarts once. It removes itself as soon as the new driver has shown its display
+# (nullmoth-nv-ok), so nothing keeps running on a Mac where the update worked. A fresh install has no previous driver to
+# go back to: the guard still keeps the Mac usable, and nothing is restored.
+nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-starts 2>/dev/null || true
+nvram -d 7C436110-AB2A-4BBB-A880-FE41995C9F82:nullmoth-nv-ok 2>/dev/null || true
+LG=/Library/NullMoth/lastgood.sh; LGP=/Library/LaunchDaemons/com.nullmoth.lastgood.plist
+launchctl bootout system/com.nullmoth.lastgood 2>/dev/null || true
+rm -f "$LG" "$LGP"
+if [ -d "$BK/NVRM.kext" ]; then
+  mkdir -p /Library/NullMoth /Library/LaunchDaemons || die "create the fallback job's folders"
+  cat > "$LG.tmp" <<EOF || die "write the fallback job"
+#!/bin/bash
+# Written by the NVIDIA driver install: restores the driver in $BK if the installed one cannot start.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+BK='$BK'; LOG=/Library/NullMoth/lastgood.log; V=7C436110-AB2A-4BBB-A880-FE41995C9F82
+# no launchctl bootout here: booting out the running job kills this script before it can restart the Mac (10-17 test)
+done_job() { rm -f /Library/LaunchDaemons/com.nullmoth.lastgood.plist /Library/NullMoth/lastgood.sh; }
+if nvram \$V:nullmoth-nv-ok >/dev/null 2>&1; then echo "\$(date) the new driver brought its display up; keeping it" >> \$LOG; done_job; exit 0; fi
+v=\$(nvram \$V:nullmoth-nv-starts 2>/dev/null | cut -f2)
+case "\$v" in %0[2-9a-f]|%[1-9a-f]?) ;; *) exit 0;; esac
+[ -d "\$BK/NVRM.kext" ] || { echo "\$(date) the driver turned itself off but its backup \$BK is gone" >> \$LOG; done_job; exit 0; }
+echo "\$(date) the new driver did not bring the display up twice; restoring the previous driver from \$BK" >> \$LOG
+for k in $KEXTS; do rm -rf "$EXT/\$k.kext"; [ ! -e "\$BK/\$k.kext" ] || ditto "\$BK/\$k.kext" "$EXT/\$k.kext"; done
+for b in NVMTLDriver.bundle NVIDIAShared.bundle nvmtl nvmtl-allow.txt; do rm -rf "$GB/\$b"; [ ! -e "\$BK/\$b" ] || ditto "\$BK/\$b" "$GB/\$b"; done
+rm -rf /Library/NullMoth/kexts "$FW"
+[ ! -d "\$BK/kexts" ] || ditto "\$BK/kexts" /Library/NullMoth/kexts
+[ ! -d "\$BK/nvfw" ] || ditto "\$BK/nvfw" "$FW"
+if [ -f "\$BK/AuxiliaryKernelExtensions.kc" ]; then cp -p "\$BK/AuxiliaryKernelExtensions.kc" "$KC"; else rm -f "$KC"; fi
+[ ! -f "\$BK/os-major" ] || cp -p "\$BK/os-major" /Library/NullMoth/os-major
+nvram -d \$V:nullmoth-nv-starts 2>/dev/null
+echo "previous" > /Library/NullMoth/driver-restored
+done_job
+echo "\$(date) previous driver restored; restarting" >> \$LOG
+shutdown -r now
+EOF
+  chmod 755 "$LG.tmp" && chown root:wheel "$LG.tmp" && mv -f "$LG.tmp" "$LG" || die "install the fallback job"
+  cat > "$LGP" <<EOF || die "write the fallback job's plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>Label</key><string>com.nullmoth.lastgood</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$LG</string></array>
+<key>RunAtLoad</key><true/></dict></plist>
+EOF
+  chmod 644 "$LGP" && chown root:wheel "$LGP" || die "fallback job permissions"
+  ok "previous driver kept as the fallback ($BK)"
+else
+  ok "no previous driver to fall back to (first install)"
+fi
 ba=$(nvram boot-args 2>/dev/null | cut -f2-)
 for a in nvfb=1 nvaccel=1; do case " $ba " in *" $a "*) ;; *) echo "   NOTE: boot-args lack '$a' — add it in your OpenCore config.plist (README: Install — by hand), or let the 1401 Mac app set OpenCore up";; esac; done
 
